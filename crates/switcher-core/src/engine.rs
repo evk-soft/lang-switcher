@@ -4,7 +4,7 @@
 use switcher_platform::events::{LangTag, LayoutId, LayoutSource, Point};
 use switcher_platform::ports::SoundCue;
 
-use crate::config::{BadgeMode, Config};
+use crate::config::{AnchorPref, BadgeMode, Config};
 use crate::content::{BadgeContent, cue_for};
 
 /// A source reporting the layout we just switched AWAY from within this window
@@ -75,8 +75,6 @@ enum BadgeState {
     Hidden,
     /// QueryAnchor issued, waiting for AnchorResolved.
     AwaitingAnchor,
-    // Constructed once anchor resolution lands in the next step; drop this allow then.
-    #[allow(dead_code)]
     Visible {
         tracking: bool,
     },
@@ -113,7 +111,7 @@ impl Engine {
                 lang,
                 source,
             } => self.on_layout(layout, lang, source, now_ms),
-            Event::AnchorResolved { .. } => todo!("task 6"),
+            Event::AnchorResolved { caret, cursor } => self.on_anchor(caret, cursor),
             Event::Pointer { .. }
             | Event::HideTimerFired
             | Event::SetMode(_)
@@ -159,15 +157,51 @@ impl Engine {
         fx.push(Effect::QueryAnchor);
         fx
     }
+
+    fn on_anchor(&mut self, caret: Option<Point>, cursor: Option<Point>) -> Vec<Effect> {
+        if self.badge != BadgeState::AwaitingAnchor {
+            return vec![];
+        }
+        let anchor = match self.cfg.badge.anchor {
+            AnchorPref::Auto => caret
+                .map(ResolvedAnchor::Caret)
+                .or(cursor.map(ResolvedAnchor::Cursor))
+                .unwrap_or(ResolvedAnchor::Fixed),
+            AnchorPref::Cursor => cursor
+                .map(ResolvedAnchor::Cursor)
+                .unwrap_or(ResolvedAnchor::Fixed),
+            AnchorPref::Fixed => ResolvedAnchor::Fixed,
+        };
+        let tracking = matches!(anchor, ResolvedAnchor::Cursor(_));
+        let (_, lang) = self
+            .layout
+            .as_ref()
+            .expect("badge is pending only after an accepted layout event");
+        let content = BadgeContent::for_lang(lang, self.cfg.badge.style, &self.cfg.badge.colors);
+        self.badge = BadgeState::Visible { tracking };
+        let mut fx = vec![
+            Effect::ShowBadge { content, anchor },
+            Effect::SetPointerTracking(tracking),
+        ];
+        match self.cfg.badge.mode {
+            BadgeMode::Transient => fx.push(Effect::ArmHideTimer {
+                after_ms: self.cfg.badge.show_ms,
+            }),
+            BadgeMode::Follow => fx.push(Effect::CancelHideTimer),
+        }
+        fx
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use switcher_platform::events::{LangTag, LayoutId, LayoutSource};
+    use std::collections::BTreeMap;
+    use switcher_platform::events::{LangTag, LayoutId, LayoutSource, Point};
     use switcher_platform::ports::SoundCue;
 
     use crate::config::Config;
+    use crate::content::{BadgeContent, BadgeStyle};
 
     pub(super) const RU_ID: LayoutId = LayoutId(0x0419_0419);
     pub(super) const EN_ID: LayoutId = LayoutId(0x0409_0409);
@@ -270,5 +304,116 @@ mod tests {
         let fx = e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
         assert!(!fx.iter().any(|f| matches!(f, Effect::PlaySound { .. })));
         assert!(fx.contains(&Effect::QueryAnchor));
+    }
+
+    pub(super) fn resolved(caret: Option<Point>, cursor: Option<Point>) -> Event {
+        Event::AnchorResolved { caret, cursor }
+    }
+
+    pub(super) fn p(x: i32, y: i32) -> Point {
+        Point { x, y }
+    }
+
+    pub(super) fn default_content(lang: &LangTag) -> BadgeContent {
+        BadgeContent::for_lang(lang, BadgeStyle::Text, &BTreeMap::new())
+    }
+
+    #[test]
+    fn auto_anchor_prefers_caret_and_does_not_track_pointer() {
+        let mut e = engine_after_initial();
+        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
+        let fx = e.handle(resolved(Some(p(5, 6)), Some(p(9, 9))), 1001);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::ShowBadge {
+                    content: default_content(&ru()),
+                    anchor: ResolvedAnchor::Caret(p(5, 6)),
+                },
+                Effect::SetPointerTracking(false),
+                Effect::ArmHideTimer { after_ms: 1500 },
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_anchor_falls_back_to_cursor_and_tracks() {
+        let mut e = engine_after_initial();
+        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
+        let fx = e.handle(resolved(None, Some(p(9, 9))), 1001);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::ShowBadge {
+                    content: default_content(&ru()),
+                    anchor: ResolvedAnchor::Cursor(p(9, 9)),
+                },
+                Effect::SetPointerTracking(true),
+                Effect::ArmHideTimer { after_ms: 1500 },
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_anchor_falls_back_to_fixed_when_nothing_available() {
+        let mut e = engine_after_initial();
+        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
+        let fx = e.handle(resolved(None, None), 1001);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::ShowBadge {
+                    content: default_content(&ru()),
+                    anchor: ResolvedAnchor::Fixed,
+                },
+                Effect::SetPointerTracking(false),
+                Effect::ArmHideTimer { after_ms: 1500 },
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_pref_ignores_caret() {
+        let mut cfg = Config::default();
+        cfg.badge.anchor = crate::config::AnchorPref::Cursor;
+        let mut e = Engine::new(cfg);
+        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
+        let fx = e.handle(resolved(Some(p(5, 6)), Some(p(9, 9))), 1001);
+        assert!(fx.contains(&Effect::ShowBadge {
+            content: default_content(&ru()),
+            anchor: ResolvedAnchor::Cursor(p(9, 9)),
+        }));
+    }
+
+    #[test]
+    fn fixed_pref_ignores_caret_and_cursor() {
+        let mut cfg = Config::default();
+        cfg.badge.anchor = crate::config::AnchorPref::Fixed;
+        let mut e = Engine::new(cfg);
+        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
+        let fx = e.handle(resolved(Some(p(5, 6)), Some(p(9, 9))), 1001);
+        assert!(fx.contains(&Effect::ShowBadge {
+            content: default_content(&ru()),
+            anchor: ResolvedAnchor::Fixed,
+        }));
+        assert!(fx.contains(&Effect::SetPointerTracking(false)));
+    }
+
+    #[test]
+    fn follow_mode_cancels_timer_instead_of_arming() {
+        let mut cfg = Config::default();
+        cfg.badge.mode = crate::config::BadgeMode::Follow;
+        let mut e = Engine::new(cfg);
+        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
+        let fx = e.handle(resolved(None, Some(p(9, 9))), 1001);
+        assert!(fx.contains(&Effect::CancelHideTimer));
+        assert!(!fx.iter().any(|f| matches!(f, Effect::ArmHideTimer { .. })));
+    }
+
+    #[test]
+    fn anchor_resolved_while_not_awaiting_is_ignored() {
+        let mut e = engine_after_initial();
+        let fx = e.handle(resolved(None, Some(p(9, 9))), 500);
+        assert_eq!(fx, vec![]);
     }
 }
