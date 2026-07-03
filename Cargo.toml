@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+switcher-core = { path = "crates/switcher-core" }
+switcher-platform = { path = "crates/switcher-platform" }
+switcher-windows = { path = "crates/switcher-windows" }
+
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+thiserror = "2.0"
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+directories = "6.0"
+tiny-skia = "0.12"
+ab_glyph = "0.2"
+rodio = "0.22"
+tray-icon = "0.24"
+muda = "0.19"
+windows = "0.62"
+embed-manifest = "1.5"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
