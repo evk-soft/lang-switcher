@@ -162,6 +162,14 @@ impl Engine {
         if source == LayoutSource::Initial {
             return fx;
         }
+        // Superseding a still-visible transient badge: cancel its pending hide timer so
+        // the single-timer invariant holds across the AwaitingAnchor gap (the new badge
+        // re-arms in on_anchor). Every other path out of Visible already clears the timer.
+        if matches!(self.badge, BadgeState::Visible { .. })
+            && self.cfg.badge.mode == BadgeMode::Transient
+        {
+            fx.push(Effect::CancelHideTimer);
+        }
         if self.cfg.sound.enabled {
             fx.push(Effect::PlaySound {
                 cue: cue_for(&lang),
@@ -513,6 +521,9 @@ mod tests {
         let mut e = engine_with_visible_badge();
         let fx = e.handle(layout(EN_ID, en(), LayoutSource::ShellHook), 2000);
         assert!(fx.contains(&Effect::QueryAnchor));
+        // The superseded transient badge's hide timer must be cancelled here, otherwise it
+        // stays armed across the AwaitingAnchor gap (regression: on_layout used to leak it).
+        assert!(fx.contains(&Effect::CancelHideTimer));
         let fx = e.handle(resolved(None, Some(p(20, 20))), 2001);
         assert!(fx.contains(&Effect::ShowBadge {
             content: default_content(&en()),
