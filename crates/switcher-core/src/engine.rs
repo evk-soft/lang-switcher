@@ -112,11 +112,26 @@ impl Engine {
                 source,
             } => self.on_layout(layout, lang, source, now_ms),
             Event::AnchorResolved { caret, cursor } => self.on_anchor(caret, cursor),
-            Event::Pointer { .. }
-            | Event::HideTimerFired
-            | Event::SetMode(_)
-            | Event::SetSoundEnabled(_)
-            | Event::SetAutostart(_) => todo!("task 7"),
+            Event::Pointer { pos } => match self.badge {
+                BadgeState::Visible { tracking: true } => vec![Effect::MoveBadge { pos }],
+                _ => vec![],
+            },
+            Event::HideTimerFired => match self.badge {
+                BadgeState::Visible { .. } if self.cfg.badge.mode == BadgeMode::Transient => {
+                    self.badge = BadgeState::Hidden;
+                    vec![Effect::HideBadge, Effect::SetPointerTracking(false)]
+                }
+                _ => vec![],
+            },
+            Event::SetMode(mode) => self.on_set_mode(mode),
+            Event::SetSoundEnabled(enabled) => {
+                self.cfg.sound.enabled = enabled;
+                vec![Effect::PersistConfig]
+            }
+            Event::SetAutostart(enabled) => {
+                self.cfg.autostart = enabled;
+                vec![Effect::ApplyAutostart(enabled), Effect::PersistConfig]
+            }
         }
     }
 
@@ -188,6 +203,26 @@ impl Engine {
                 after_ms: self.cfg.badge.show_ms,
             }),
             BadgeMode::Follow => fx.push(Effect::CancelHideTimer),
+        }
+        fx
+    }
+
+    fn on_set_mode(&mut self, mode: BadgeMode) -> Vec<Effect> {
+        if self.cfg.badge.mode == mode {
+            return vec![];
+        }
+        self.cfg.badge.mode = mode;
+        let mut fx = vec![Effect::PersistConfig];
+        match (mode, self.badge) {
+            (BadgeMode::Follow, BadgeState::Hidden) if self.layout.is_some() => {
+                self.badge = BadgeState::AwaitingAnchor;
+                fx.push(Effect::QueryAnchor);
+            }
+            (BadgeMode::Follow, BadgeState::Visible { .. }) => fx.push(Effect::CancelHideTimer),
+            (BadgeMode::Transient, BadgeState::Visible { .. }) => fx.push(Effect::ArmHideTimer {
+                after_ms: self.cfg.badge.show_ms,
+            }),
+            _ => {}
         }
         fx
     }
@@ -415,5 +450,141 @@ mod tests {
         let mut e = engine_after_initial();
         let fx = e.handle(resolved(None, Some(p(9, 9))), 500);
         assert_eq!(fx, vec![]);
+    }
+
+    /// Engine with a visible cursor-anchored RU badge (transient mode), t=1000.
+    pub(super) fn engine_with_visible_badge() -> Engine {
+        let mut e = engine_after_initial();
+        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
+        let fx = e.handle(resolved(None, Some(p(10, 10))), 1000);
+        assert!(fx.iter().any(|f| matches!(f, Effect::ShowBadge { .. })));
+        e
+    }
+
+    #[test]
+    fn pointer_moves_visible_tracking_badge() {
+        let mut e = engine_with_visible_badge();
+        let fx = e.handle(Event::Pointer { pos: p(50, 60) }, 1100);
+        assert_eq!(fx, vec![Effect::MoveBadge { pos: p(50, 60) }]);
+    }
+
+    #[test]
+    fn pointer_is_ignored_when_badge_hidden() {
+        let mut e = engine_after_initial();
+        let fx = e.handle(Event::Pointer { pos: p(50, 60) }, 1100);
+        assert_eq!(fx, vec![]);
+    }
+
+    #[test]
+    fn pointer_is_ignored_when_caret_anchored() {
+        let mut e = engine_after_initial();
+        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
+        e.handle(resolved(Some(p(5, 6)), Some(p(9, 9))), 1001);
+        let fx = e.handle(Event::Pointer { pos: p(50, 60) }, 1100);
+        assert_eq!(fx, vec![]);
+    }
+
+    #[test]
+    fn hide_timer_hides_badge_and_stops_tracking() {
+        let mut e = engine_with_visible_badge();
+        let fx = e.handle(Event::HideTimerFired, 2500);
+        assert_eq!(
+            fx,
+            vec![Effect::HideBadge, Effect::SetPointerTracking(false)]
+        );
+        // Once hidden, pointer noise is ignored.
+        let fx = e.handle(Event::Pointer { pos: p(1, 1) }, 2600);
+        assert_eq!(fx, vec![]);
+    }
+
+    #[test]
+    fn stale_hide_timer_in_follow_mode_is_ignored() {
+        let mut cfg = Config::default();
+        cfg.badge.mode = crate::config::BadgeMode::Follow;
+        let mut e = Engine::new(cfg);
+        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
+        e.handle(resolved(None, Some(p(9, 9))), 1001);
+        let fx = e.handle(Event::HideTimerFired, 2500);
+        assert_eq!(fx, vec![]);
+    }
+
+    #[test]
+    fn second_change_while_visible_requeries_anchor_and_rearms() {
+        let mut e = engine_with_visible_badge();
+        let fx = e.handle(layout(EN_ID, en(), LayoutSource::ShellHook), 2000);
+        assert!(fx.contains(&Effect::QueryAnchor));
+        let fx = e.handle(resolved(None, Some(p(20, 20))), 2001);
+        assert!(fx.contains(&Effect::ShowBadge {
+            content: default_content(&en()),
+            anchor: ResolvedAnchor::Cursor(p(20, 20)),
+        }));
+        assert!(fx.contains(&Effect::ArmHideTimer { after_ms: 1500 }));
+    }
+
+    #[test]
+    fn set_mode_follow_while_hidden_shows_badge_and_persists() {
+        let mut e = engine_after_initial();
+        let fx = e.handle(Event::SetMode(crate::config::BadgeMode::Follow), 3000);
+        assert_eq!(fx, vec![Effect::PersistConfig, Effect::QueryAnchor]);
+        assert_eq!(e.config().badge.mode, crate::config::BadgeMode::Follow);
+    }
+
+    #[test]
+    fn set_mode_follow_before_any_layout_only_persists() {
+        let mut e = Engine::new(Config::default());
+        let fx = e.handle(Event::SetMode(crate::config::BadgeMode::Follow), 10);
+        assert_eq!(fx, vec![Effect::PersistConfig]);
+    }
+
+    #[test]
+    fn set_mode_follow_while_visible_cancels_timer() {
+        let mut e = engine_with_visible_badge();
+        let fx = e.handle(Event::SetMode(crate::config::BadgeMode::Follow), 1200);
+        assert_eq!(fx, vec![Effect::PersistConfig, Effect::CancelHideTimer]);
+    }
+
+    #[test]
+    fn set_mode_transient_while_visible_arms_timer() {
+        let mut cfg = Config::default();
+        cfg.badge.mode = crate::config::BadgeMode::Follow;
+        let mut e = Engine::new(cfg);
+        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
+        e.handle(resolved(None, Some(p(9, 9))), 1001);
+        let fx = e.handle(Event::SetMode(crate::config::BadgeMode::Transient), 1200);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::PersistConfig,
+                Effect::ArmHideTimer { after_ms: 1500 }
+            ]
+        );
+    }
+
+    #[test]
+    fn set_mode_same_is_noop() {
+        let mut e = engine_after_initial();
+        let fx = e.handle(Event::SetMode(crate::config::BadgeMode::Transient), 1200);
+        assert_eq!(fx, vec![]);
+    }
+
+    #[test]
+    fn set_sound_enabled_updates_config_and_persists() {
+        let mut e = engine_after_initial();
+        let fx = e.handle(Event::SetSoundEnabled(false), 1200);
+        assert_eq!(fx, vec![Effect::PersistConfig]);
+        assert!(!e.config().sound.enabled);
+        let fx = e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 2000);
+        assert!(!fx.iter().any(|f| matches!(f, Effect::PlaySound { .. })));
+    }
+
+    #[test]
+    fn set_autostart_applies_and_persists() {
+        let mut e = engine_after_initial();
+        let fx = e.handle(Event::SetAutostart(true), 1200);
+        assert_eq!(
+            fx,
+            vec![Effect::ApplyAutostart(true), Effect::PersistConfig]
+        );
+        assert!(e.config().autostart);
     }
 }
