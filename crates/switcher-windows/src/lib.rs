@@ -3,5 +3,6 @@
 #![cfg(windows)]
 
 pub mod dpi;
+pub mod overlay;
 pub mod supervise;
 pub mod win_util;

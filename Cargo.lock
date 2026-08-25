@@ -972,6 +972,7 @@ dependencies = [
  "crossbeam-channel",
  "switcher-platform",
  "tracing",
+ "tracing-subscriber",
  "windows",
 ]
 

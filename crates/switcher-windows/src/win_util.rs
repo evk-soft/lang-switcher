@@ -23,7 +23,7 @@ use std::thread::JoinHandle;
 
 use switcher_platform::ports::PlatformError;
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HMODULE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -75,6 +75,68 @@ pub fn post_quit() {
     unsafe { PostQuitMessage(0) };
 }
 
+/// Registers a window class if it is not registered yet, and hands back the module handle
+/// its windows must be created with.
+///
+/// Passing `None` for `wndproc` means "I only care about thread messages" and gets the
+/// default handler — never a NULL procedure, which aborts the process from inside
+/// `CreateWindowExW` (found the hard way; see [`default_wndproc`]).
+///
+/// **Precondition: `class_name` must be unique per window procedure in this process.**
+/// Window classes are process-wide, so if the name is already registered this reuses the
+/// existing class *as it was registered* — a second caller passing a different `wndproc`
+/// under the same name would silently get the first one's, and its messages would go
+/// somewhere it never wrote. Every call site in this crate uses a name derived from its own
+/// module for that reason.
+///
+/// The class is never unregistered: see the note on [`HiddenWindow`]'s `Drop`.
+pub fn register_class(class_name: &str, wndproc: WNDPROC) -> Result<HMODULE, PlatformError> {
+    let wndproc = wndproc.or(Some(default_wndproc));
+    let class = wide(class_name);
+
+    // SAFETY: `GetModuleHandleW` with a null name returns a handle to the current process'
+    // own module. That handle is not owned (nothing to free) and stays valid for the
+    // process lifetime.
+    let module = unsafe { GetModuleHandleW(PCWSTR::null()) }
+        .map_err(|e| PlatformError::new("module_handle_failed", e.message()))?;
+
+    let descriptor = WNDCLASSW {
+        lpfnWndProc: wndproc,
+        hInstance: module.into(),
+        lpszClassName: PCWSTR::from_raw(class.as_ptr()),
+        ..Default::default()
+    };
+
+    // SAFETY: `descriptor` lives across the call, and the string it points at (`class`)
+    // outlives the call too and is NUL-terminated by `wide`. `wndproc` is an
+    // `extern "system"` function pointer with the ABI Windows expects, and it points at
+    // code that lives for the whole program, which is required because the class outlives
+    // this call (see the note on unregistering below).
+    let atom = unsafe { RegisterClassW(&descriptor) };
+    if atom == 0 {
+        // SAFETY: reads the calling thread's last-error value; no preconditions.
+        let err = unsafe { GetLastError() };
+        // A class registered by an earlier window of the same purpose is a success: the
+        // class is process-wide and we intentionally never unregister it. Logged rather
+        // than silent, because it is also what a name collision between two different
+        // window procedures looks like (see the precondition above).
+        if err == ERROR_CLASS_ALREADY_EXISTS {
+            tracing::debug!(
+                target: "switcher_windows::win_util",
+                class = class_name,
+                "reusing an already registered window class"
+            );
+        } else {
+            return Err(PlatformError::new(
+                "window_class_register_failed",
+                format!("RegisterClassW({class_name}) failed: {err:?}"),
+            ));
+        }
+    }
+
+    Ok(module)
+}
+
 /// A message-only window, owned by the thread that created it.
 ///
 /// Not `Send` (`HWND` is a raw pointer), and that is load-bearing rather than incidental:
@@ -89,64 +151,17 @@ impl HiddenWindow {
     /// Registers `class_name` if needed and creates a message-only window for it.
     ///
     /// `create_param` is handed to the window procedure with `WM_NCCREATE`/`WM_CREATE`,
-    /// which is how a wndproc gets access to state without a global. Passing `None` for
-    /// `wndproc` means "I only care about thread messages" and gets the default handler —
-    /// never a NULL procedure, which would abort the process.
+    /// which is how a wndproc gets access to state without a global.
     ///
-    /// **Precondition: `class_name` must be unique per window procedure in this process.**
-    /// Window classes are process-wide, so if the name is already registered this reuses
-    /// the existing class *as it was registered* — a second caller passing a different
-    /// `wndproc` under the same name would silently get the first one's, and its messages
-    /// would go somewhere it never wrote. Every call site in this crate uses a name derived
-    /// from its own module for that reason.
+    /// Carries [`register_class`]' precondition: **`class_name` must be unique per window
+    /// procedure in this process.**
     pub fn new(
         class_name: &str,
         wndproc: WNDPROC,
         create_param: Option<*const c_void>,
     ) -> Result<Self, PlatformError> {
-        let wndproc = wndproc.or(Some(default_wndproc));
         let class = wide(class_name);
-
-        // SAFETY: `GetModuleHandleW` with a null name returns a handle to the current
-        // process' own module. That handle is not owned (nothing to free) and stays valid
-        // for the process lifetime.
-        let module = unsafe { GetModuleHandleW(PCWSTR::null()) }
-            .map_err(|e| PlatformError::new("module_handle_failed", e.message()))?;
-
-        let descriptor = WNDCLASSW {
-            lpfnWndProc: wndproc,
-            hInstance: module.into(),
-            lpszClassName: PCWSTR::from_raw(class.as_ptr()),
-            ..Default::default()
-        };
-
-        // SAFETY: `descriptor` lives across the call, and the string it points at
-        // (`class`) outlives the call too and is NUL-terminated by `wide`. `wndproc` is an
-        // `extern "system"` function pointer with the ABI Windows expects, and it points
-        // at code that lives for the whole program, which is required because the class
-        // outlives this call (see the note on unregistering below).
-        let atom = unsafe { RegisterClassW(&descriptor) };
-        if atom == 0 {
-            // SAFETY: reads the calling thread's last-error value; no preconditions.
-            let err = unsafe { GetLastError() };
-            // A class registered by an earlier window of the same purpose is a success:
-            // the class is process-wide and we intentionally never unregister it. Logged
-            // rather than silent, because it is also what a name collision between two
-            // different window procedures looks like (see the precondition above).
-            if err == ERROR_CLASS_ALREADY_EXISTS {
-                tracing::debug!(
-                    target: "switcher_windows::win_util",
-                    class = class_name,
-                    "reusing an already registered window class"
-                );
-            }
-            if err != ERROR_CLASS_ALREADY_EXISTS {
-                return Err(PlatformError::new(
-                    "window_class_register_failed",
-                    format!("RegisterClassW({class_name}) failed: {err:?}"),
-                ));
-            }
-        }
+        let module = register_class(class_name, wndproc)?;
 
         // SAFETY: `HWND_MESSAGE` as the parent is what makes this a message-only window
         // (no rendering, not enumerated). The class name buffer is still alive and

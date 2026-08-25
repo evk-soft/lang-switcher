@@ -26,5 +26,11 @@ windows = { workspace = true, features = [
     "Win32_System_LibraryLoader",
 ] }
 
+[target.'cfg(windows)'.dev-dependencies]
+# The examples are this crate's only smoke harness: no unit test can see click-through,
+# focus theft or a monitor crossing. They need a subscriber installed, or the very log lines
+# the checklist asks the reader to look for would go nowhere.
+tracing-subscriber = { workspace = true }
+
 [lints]
 workspace = true
