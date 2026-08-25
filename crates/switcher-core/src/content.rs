@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 use switcher_platform::events::LangTag;
 use switcher_platform::ports::SoundCue;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BadgeStyle {
     Text,
     Color,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rgb8 {
     pub r: u8,
     pub g: u8,
@@ -55,7 +55,8 @@ pub fn parse_hex_rgb(s: &str) -> Option<Rgb8> {
     })
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// `Eq + Hash` because this doubles as the badge rasterizer's cache key (ADR-0006).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BadgeContent {
     pub label: String,
     pub bg: Rgb8,
@@ -207,6 +208,24 @@ mod tests {
 
         let empty = BadgeContent::for_lang(&LangTag::new(""), BadgeStyle::Text, &BTreeMap::new());
         assert_eq!(empty.label, "??");
+    }
+
+    /// `BadgeContent` is the cache key of the badge rasterizer (ADR-0006), so it has to
+    /// behave in a `HashSet`: equal content must collapse, different content must not.
+    #[test]
+    fn badge_content_is_usable_as_a_cache_key() {
+        use std::collections::HashSet;
+
+        let ru = BadgeContent::for_lang(&LangTag::new("ru-RU"), BadgeStyle::Text, &BTreeMap::new());
+        let en = BadgeContent::for_lang(&LangTag::new("en-US"), BadgeStyle::Text, &BTreeMap::new());
+        let mut set = HashSet::new();
+        assert!(set.insert(ru.clone()));
+        assert!(set.insert(en));
+        assert!(
+            !set.insert(ru),
+            "equal content must not create a second entry"
+        );
+        assert_eq!(set.len(), 2);
     }
 
     #[test]

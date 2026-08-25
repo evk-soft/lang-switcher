@@ -13,6 +13,7 @@ path = "src/main.rs"
 switcher-core = { workspace = true }
 switcher-platform = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 crossbeam-channel = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
@@ -22,11 +23,12 @@ directories = { workspace = true }
 tiny-skia = { workspace = true }
 ab_glyph = { workspace = true }
 rodio = { workspace = true }
-tray-icon = { workspace = true }
-muda = { workspace = true }
 
+# The tray exists only on Windows in M1, and `muda` comes with it as `tray_icon::menu`
+# rather than as a second path to the same types (ADR-0008).
 [target.'cfg(windows)'.dependencies]
 switcher-windows = { workspace = true }
+tray-icon = { workspace = true }
 
 [lints]
 workspace = true

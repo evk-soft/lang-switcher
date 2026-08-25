@@ -21,7 +21,7 @@
 | 5 | switcher-core — engine: приём раскладки и дедуп | ✅ сделано | `45003ac` |
 | 6 | switcher-core — engine: выбор якоря и показ | ✅ сделано | `97109a5` |
 | 7 | switcher-core — engine: жизненный цикл, режимы, трей | ✅ сделано | `37efa92`, `af4be79` |
-| 8 | порты и ядро под ADR-0005…0008, урезание зависимостей | ⬜ | |
+| 8 | порты и ядро под ADR-0005…0008, урезание зависимостей | ✅ сделано | ветка `feat/m1-task8-contracts` |
 | 9 | фундамент: манифест PMv2, win_util, supervise | ⬜ | |
 | 10 | overlay.rs + geometry.rs + overlay_smoke — **риск №1 (1/2)** | ⬜ | |
 | 11 | pointer.rs (Raw Input): бейдж следует за курсором — **риск №1 (2/2)** | ⬜ | |
@@ -2043,10 +2043,12 @@ fn normalize_enum(value: &str, allowed: &[&str], default: &str, field: &str,
 
 Вызвать её в `sanitize()` для `log_level` (default `"info"`) и `ui_language` (default `"ru"`). Мотив в комментарии: сейчас это свободные строки, и мусор из файла доходит до инициализации логов.
 
+Там же — **нормализация ключей `badge.colors` к нижнему регистру**, тот же класс тихой опечатки: `BadgeContent::for_lang` ищет `colors.get(&primary)`, а `LangTag::primary()` возвращает нижний регистр, поэтому ключ `RU` проходит валидацию значения, не даёт ни одного предупреждения и при этом не применяется никогда. Ключ переименовывается с предупреждением; если нижнерегистровый дубликат уже есть — mixed-case вариант отбрасывается, тоже с предупреждением (детерминированно, без зависимости от порядка обхода). Два теста: `badge_color_keys_are_normalized_to_lower_case` и `duplicate_badge_color_keys_keep_the_lower_case_one`.
+
 - [ ] **Шаг 6: убедиться, что тесты проходят, и посчитать их**
 
 Запустить: `cargo test --workspace`
-Ожидание: PASS. Арифметика обязана сойтись: было 43 (42 core + 1 platform). `engine.rs` 27 → 32 (27 − 1 удалённый + 6 новых; ещё один переписан на месте, счёт не меняя), `config.rs` 9 → 12, `content.rs` 6 → 7, итого core 51; `events.rs` 1 → 3. **54 теста в воркспейсе.** Если цифра другая — сверить со списком выше, а не «округлить».
+Ожидание: PASS. Арифметика обязана сойтись: было 43 (42 core + 1 platform). `engine.rs` 27 → 32 (27 − 1 удалённый + 6 новых; ещё один переписан на месте, счёт не меняя), `config.rs` 9 → 14 (три теста на `log_level`/`ui_language` + два на нормализацию ключей `badge.colors`, см. шаг 5), `content.rs` 6 → 7, итого core 53; `events.rs` 1 → 3. **56 тестов в воркспейсе.** Если цифра другая — сверить со списком выше, а не «округлить».
 
 - [ ] **Шаг 7: зависимости по ADR-0008**
 
@@ -2062,8 +2064,10 @@ tray-icon  = { version = "0.24", default-features = false }
 `windows = "0.62"` **не трогать**: его единственная default-фича — `std` (`windows-0.62.2/Cargo.toml:711`), и она нужна. Добавить перед `[workspace.lints.rust]`:
 
 ```toml
-# ADR-0007: `panic = "abort"` is forbidden in every profile — it would turn the hook-thread
-# supervisor (catch_unwind in switcher-windows/src/supervise.rs) into dead code.
+# ADR-0007: `panic = "abort"` is forbidden in every profile — unwinding is a precondition
+# of the hook-thread supervisor (switcher-windows/src/supervise.rs). Note that the outer
+# catch_unwind only fires if each extern "system" callback guards its own body: an unwind
+# reaching a non-unwind extern boundary aborts the process (Rust >= 1.81).
 ```
 
 `crates/switcher-app/Cargo.toml`: удалить `muda`, добавить `thiserror = { workspace = true }` (для `RenderError`, ADR-0006), перенести `tray-icon = { workspace = true }` из `[dependencies]` в `[target.'cfg(windows)'.dependencies]`.
@@ -2100,7 +2104,7 @@ tray-icon  = { version = "0.24", default-features = false }
 - [ ] **Шаг 10: гейты и коммит**
 
 Запустить: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check`
-Ожидание: чисто, 54 теста.
+Ожидание: чисто, 56 тестов.
 
 ```bash
 git add Cargo.toml Cargo.lock crates/switcher-core crates/switcher-platform crates/switcher-app/Cargo.toml crates/switcher-windows/Cargo.toml
@@ -2258,8 +2262,16 @@ where F: Fn(&Sender<PlatformEvent>) -> Result<(), PlatformError> + Send + 'stati
 
 В шапке модуля — комментарий, что весь механизм мёртв при `panic = "abort"` (см. запрет в корневом `Cargo.toml`, ADR-0007), и что константы 250/1000/4000/60 с — инженерное суждение, проверяемое эмпирически (убить `explorer.exe` и замерить восстановление shell-hook), а не выведенное из документации.
 
+**Границу FFI закрыть обязательно, иначе внешний `catch_unwind` бесполезен.** Сигнатуры `WNDPROC` (`UI/WindowsAndMessaging/mod.rs:7249`) и `WINEVENTPROC` (`UI/Accessibility/mod.rs:21016`) объявлены `extern "system"`, а **не** `extern "system-unwind"`, а с Rust 1.81 разворачивание, дошедшее до такой границы, аварийно завершает процесс (MSRV проекта 1.87). Работа хуков исполняется именно внутри этих колбэков, поэтому:
+
+- каждый наш `extern "system"` колбэк (wndproc из шага 4, `WINEVENTPROC` и `WM_TIMER`-ветка задачи 12, TSF-колбэк задачи 13) оборачивает **всё своё тело** в `std::panic::catch_unwind(AssertUnwindSafe(...))`;
+- при поймённой панике колбэк пишет `error!` с `cap.key()`, возвращает безопасный результат (`DefWindowProcW(...)` для wndproc, ничего для `WINEVENTPROC`) и просит поток завершиться (`PostQuitMessage` на своём потоке), чтобы уже внешний `catch_unwind` супервизора увидел штатный выход и применил backoff;
+- добавить хелпер `guard_callback` в `supervise.rs`, чтобы это не копировалось в четырёх местах, и тест на него: паника внутри переданного замыкания не разворачивается наружу, а возвращает подставленный default.
+
+Без этого шага обещание ADR-0007 «источник перезапускается, а при исчерпании бюджета гаснет с сообщением в трей» не выполняется ни для одного реального места паники: процесс просто аборт, без флаша лога.
+
 Запустить: `cargo test -p switcher-windows`
-Ожидание: PASS, 7 тестов в крейте (3 + 4); в воркспейсе 61.
+Ожидание: PASS, 7 тестов в крейте (3 + 4); в воркспейсе 63.
 
 - [ ] **Шаг 7: smoke — доказать, что манифест встроился**
 
@@ -2275,7 +2287,7 @@ where F: Fn(&Sender<PlatformEvent>) -> Result<(), PlatformError> + Send + 'stati
 - [ ] **Шаг 8: гейты и коммит**
 
 Запустить: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check`
-Ожидание: чисто, 61 тест.
+Ожидание: чисто, 63 теста.
 
 ```bash
 git add crates/switcher-app/build.rs crates/switcher-app/lang-switcher.manifest crates/switcher-app/src/main.rs crates/switcher-windows docs/smoke/m1-windows.md

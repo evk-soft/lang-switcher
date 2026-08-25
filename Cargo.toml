@@ -22,13 +22,25 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 directories = "6.0"
-tiny-skia = "0.12"
-ab_glyph = "0.2"
-rodio = "0.22"
-tray-icon = "0.24"
-muda = "0.19"
+# Every dependency below is trimmed per ADR-0008: default features pulled in decoders,
+# PNG and variable-font machinery that M1 never uses, against a 1-4 MB binary budget.
+# `muda` is reached through `tray_icon::menu`, so it is deliberately not a direct
+# dependency; `embed-manifest` is gone because the PMv2 manifest is embedded via linker
+# flags from switcher-app's build.rs (ADR-0010).
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
+ab_glyph = { version = "0.2", default-features = false, features = ["std"] }
+rodio = { version = "0.22", default-features = false, features = ["playback"] }
+tray-icon = { version = "0.24", default-features = false }
+# The only default feature of `windows` is `std`, and it is needed.
 windows = "0.62"
-embed-manifest = "1.5"
+
+# NOTE (ADR-0007): `panic = "abort"` is forbidden in every profile — it is a PRECONDITION
+# of the hook-thread supervisor, not the whole mechanism. `catch_unwind` around a thread
+# body only observes panics raised in Rust frames. The hook work itself runs inside our own
+# `extern "system"` callbacks (wndproc, WINEVENTPROC), and since Rust 1.81 an unwind that
+# reaches a non-`-unwind` `extern` boundary aborts the process, so the outer `catch_unwind`
+# never sees it. Every such callback must therefore guard its own body and return a default
+# result; only then does the documented backoff-and-degrade path exist at all.
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
