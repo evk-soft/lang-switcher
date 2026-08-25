@@ -36,7 +36,6 @@ const HOLE_96: i32 = 8;
 
 const STEPS: u32 = 40;
 const STEP_PAUSE: Duration = Duration::from_millis(150);
-const IDLE_AFTER: Duration = Duration::from_secs(20);
 
 fn main() {
     tracing_subscriber::fmt()
@@ -113,12 +112,20 @@ fn main() {
 
     overlay.hide();
     tracing::info!(
-        idle_seconds = IDLE_AFTER.as_secs(),
-        "badge hidden; the process is now idle — check Task Manager for 0% CPU"
+        "badge hidden; the process is now idle — check Task Manager for 0% CPU, then press \
+         Enter to exit"
     );
-    std::thread::sleep(IDLE_AFTER);
-    drain(&events_rx);
 
+    // A blocking read rather than a sleep, and not only for the reader's sake: the process
+    // now waits on the OS with no timer and no wakeups of any kind, which is exactly the
+    // state the 0% CPU check is about. A fixed countdown also made the check a race against
+    // the clock — the first two runs on the author's machine were both cut short with Ctrl+C
+    // because the wait was blind. With a redirected or empty stdin this reads EOF and exits
+    // at once, so scripted runs do not hang.
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+
+    drain(&events_rx);
     tracing::info!("done");
 }
 
@@ -190,11 +197,18 @@ fn diagonal_across_the_virtual_desktop() -> Vec<Point> {
     };
     tracing::info!(left, top, width, height, "virtual desktop bounds");
 
+    // `SM_CXVIRTUALSCREEN` is a width, so the last pixel is at `left + width - 1`. Walking
+    // to `left + width` would put the final steps outside the desktop, where clamping pins
+    // them all to the same corner and the badge visibly sticks at the end of the run —
+    // making the "does it follow smoothly" observation harder for no reason.
+    let span_x = width.saturating_sub(1).max(0);
+    let span_y = height.saturating_sub(1).max(0);
+
     let last = i32::try_from(STEPS.saturating_sub(1)).unwrap_or(1).max(1);
     (0..i32::try_from(STEPS).unwrap_or(2))
         .map(|step| Point {
-            x: left + width * step / last,
-            y: top + height * step / last,
+            x: left + span_x * step / last,
+            y: top + span_y * step / last,
         })
         .collect()
 }
