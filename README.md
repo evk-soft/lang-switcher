@@ -2,7 +2,7 @@
 
 Лёгкий кроссплатформенный индикатор текущей раскладки клавиатуры (RU/EN): небольшой бейдж-флаг возле курсора мыши или текстовой каретки и опциональный звуковой сигнал при переключении — чтобы всегда было видно, на каком языке вы сейчас печатаете.
 
-**Статус:** проектирование (июль 2026). Код ещё не написан — утверждается архитектура.
+**Статус:** M1 (Windows MVP) в работе. Готово ядро `switcher-core` — автомат раскладки, выбор якоря, жизненный цикл бейджа, модель конфига; 42 unit-теста в ядре (43 в воркспейсе — плюс один в `switcher-platform`). Платформенные адаптеры (`switcher-windows`) и оболочка (`switcher-app`) ещё не написаны, поэтому **собранный бинарник пока ничего не делает** — `main()` пустой. Порядок дальнейших работ — в [плане M1](docs/superpowers/plans/2026-07-03-m1-windows-mvp.md).
 
 ## Ключевые требования
 
@@ -15,14 +15,37 @@
 
 Чистый нативный **Rust** (без webview): Cargo workspace с UI-независимым ядром и адаптерами под каждую ОС. Обоснование выбора — [аудит технологий](docs/research/2026-07-03-tech-audit.md) и [ADR-0001](docs/architecture/adr/0001-pure-native-rust.md).
 
+| Крейт | Роль |
+|---|---|
+| `switcher-core` | домен: автомат раскладки, выбор якоря, модель конфига. Без OS-зависимостей, `#![forbid(unsafe_code)]` |
+| `switcher-platform` | порты (traits) и плоские типы событий |
+| `switcher-windows` | адаптеры Win32/COM — единственное место, где разрешён `unsafe` |
+| `switcher-app` | оболочка: трей, главный цикл, растеризация бейджа, звук, wiring |
+
+## Сборка и проверки
+
+```sh
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings   # должен быть чистым
+cargo fmt --all -- --check
+```
+
+Все три гейта обязательны перед коммитом (скил `quality-gates`) и продублированы в [CI](.github/workflows/ci.yml): гейты на Windows, отдельная проверка «ядро собирается и тестируется вне Windows» и джоб на MSRV.
+
 ## Документация
 
 - [Обзор архитектуры](docs/architecture/overview.md)
 - [ADR — записи архитектурных решений](docs/architecture/adr/)
 - [Дизайн-спецификация](docs/superpowers/specs/2026-07-03-lang-switcher-design.md)
+- [План M1 — Windows MVP](docs/superpowers/plans/2026-07-03-m1-windows-mvp.md)
 - [Аудит технологий, июнь 2026](docs/research/2026-07-03-tech-audit.md)
 
 ## Окружение разработки
 
-- Rust stable (MSRV будет зафиксирован в `Cargo.toml` при скаффолдинге).
+- Rust stable; MSRV — 1.87 (`rust-version` в корневом `Cargo.toml`, проверяется в CI).
 - Claude Code с плагинами `superpowers` (процесс разработки) и `context7` (актуальная документация API) — правила проекта в [CLAUDE.md](CLAUDE.md).
+
+## Лицензия
+
+Двойная лицензия на выбор: [MIT](LICENSE-MIT) или [Apache-2.0](LICENSE-APACHE).
