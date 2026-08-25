@@ -30,14 +30,19 @@ pub enum Event {
     SetMode(BadgeMode),
     SetSoundEnabled(bool),
     SetAutostart(bool),
+    /// The runtime's answer to `Effect::ApplyAutostart`, and the same path startup
+    /// reconciliation uses: `Autostart::is_enabled()` is the OS truth, the config only
+    /// mirrors it (ADR-0007).
+    AutostartApplied {
+        requested: bool,
+        ok: bool,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolvedAnchor {
-    Caret(Point),
-    Cursor(Point),
-    Fixed,
-}
+// `ResolvedAnchor` lives in `switcher-platform` because the overlay adapter must see it
+// (ADR-0005). Re-exported here so `switcher_core::engine::ResolvedAnchor` keeps resolving
+// for the app shell — the core's own tests would compile off a plain `use` either way.
+pub use switcher_platform::events::ResolvedAnchor;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
@@ -47,9 +52,11 @@ pub enum Effect {
         content: BadgeContent,
         anchor: ResolvedAnchor,
     },
-    /// New anchor position for the visible badge (runtime applies the offset).
+    /// New anchor for the visible badge; the adapter re-derives offset, DPI scaling and
+    /// clamping from it. Carrying the anchor kind rather than a bare point keeps
+    /// `OverlayWindow::move_to` stateless and is what M2 caret tracking will need.
     MoveBadge {
-        pos: Point,
+        anchor: ResolvedAnchor,
     },
     HideBadge,
     ArmHideTimer {
@@ -68,6 +75,10 @@ pub enum Effect {
     ApplyAutostart(bool),
     /// Config changed: runtime saves it and re-syncs tray checkmarks.
     PersistConfig,
+    /// Re-sync tray checkmarks from `Engine::config()` **without** writing the file: the
+    /// user toggled a checkbox that the OS then refused, so the menu must snap back
+    /// while the config stays as it was (ADR-0007).
+    SyncTrayMenu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,8 +123,12 @@ impl Engine {
                 source,
             } => self.on_layout(layout, lang, source, now_ms),
             Event::AnchorResolved { caret, cursor } => self.on_anchor(caret, cursor),
+            // `tracking` is only ever true for a cursor-anchored badge (see `on_anchor`),
+            // so the anchor kind here is always `Cursor`.
             Event::Pointer { pos } => match self.badge {
-                BadgeState::Visible { tracking: true } => vec![Effect::MoveBadge { pos }],
+                BadgeState::Visible { tracking: true } => vec![Effect::MoveBadge {
+                    anchor: ResolvedAnchor::Cursor(pos),
+                }],
                 _ => vec![],
             },
             Event::HideTimerFired => match self.badge {
@@ -125,12 +140,30 @@ impl Engine {
             },
             Event::SetMode(mode) => self.on_set_mode(mode),
             Event::SetSoundEnabled(enabled) => {
+                // Dedup like `on_set_mode`: the config is the only source of truth for
+                // this checkbox, so a no-op click must not rewrite the file on disk.
+                if self.cfg.sound.enabled == enabled {
+                    return vec![];
+                }
                 self.cfg.sound.enabled = enabled;
                 vec![Effect::PersistConfig]
             }
-            Event::SetAutostart(enabled) => {
-                self.cfg.autostart = enabled;
-                vec![Effect::ApplyAutostart(enabled), Effect::PersistConfig]
+            // `cfg.autostart` mirrors a registry value, so the OS — not the click —
+            // decides. No dedup on the request: the Run key may have drifted (a cleaner
+            // tool, a manual edit, another copy of the app), and a repeated toggle must
+            // be able to re-assert it.
+            Event::SetAutostart(enabled) => vec![Effect::ApplyAutostart(enabled)],
+            Event::AutostartApplied { requested, ok } => {
+                if !ok {
+                    // Refused: the config keeps its old value and the menu snaps back.
+                    // The reason travels separately as CapabilityChanged(Autostart, ..).
+                    return vec![Effect::SyncTrayMenu];
+                }
+                if self.cfg.autostart == requested {
+                    return vec![];
+                }
+                self.cfg.autostart = requested;
+                vec![Effect::PersistConfig]
             }
         }
     }
@@ -473,7 +506,12 @@ mod tests {
     fn pointer_moves_visible_tracking_badge() {
         let mut e = engine_with_visible_badge();
         let fx = e.handle(Event::Pointer { pos: p(50, 60) }, 1100);
-        assert_eq!(fx, vec![Effect::MoveBadge { pos: p(50, 60) }]);
+        assert_eq!(
+            fx,
+            vec![Effect::MoveBadge {
+                anchor: ResolvedAnchor::Cursor(p(50, 60)),
+            }]
+        );
     }
 
     #[test]
@@ -589,13 +627,97 @@ mod tests {
     }
 
     #[test]
-    fn set_autostart_applies_and_persists() {
+    fn set_sound_enabled_same_value_is_a_noop() {
+        let mut e = engine_after_initial(); // sound.enabled == true by default
+        assert_eq!(e.handle(Event::SetSoundEnabled(true), 1200), vec![]);
+        assert!(e.config().sound.enabled);
+    }
+
+    // `cfg.autostart` mirrors a registry value, so every test below asserts the same
+    // invariant from a different angle: the config never claims what the OS has not
+    // confirmed. See ADR-0007.
+
+    #[test]
+    fn set_autostart_requests_the_os_before_touching_the_config() {
         let mut e = engine_after_initial();
-        let fx = e.handle(Event::SetAutostart(true), 1200);
+        assert_eq!(
+            e.handle(Event::SetAutostart(true), 1200),
+            vec![Effect::ApplyAutostart(true)]
+        );
+        assert!(
+            !e.config().autostart,
+            "config must not claim what the OS has not confirmed"
+        );
+        let fx = e.handle(
+            Event::AutostartApplied {
+                requested: true,
+                ok: true,
+            },
+            1210,
+        );
+        assert_eq!(fx, vec![Effect::PersistConfig]);
+        assert!(e.config().autostart);
+    }
+
+    #[test]
+    fn refused_autostart_never_reaches_the_config() {
+        let mut e = engine_after_initial();
+        e.handle(Event::SetAutostart(true), 1200);
+        let fx = e.handle(
+            Event::AutostartApplied {
+                requested: true,
+                ok: false,
+            },
+            1210,
+        );
+        assert_eq!(fx, vec![Effect::SyncTrayMenu]);
+        assert!(!e.config().autostart);
+    }
+
+    #[test]
+    fn autostart_confirmation_matching_config_is_a_noop() {
+        let mut e = engine_after_initial(); // default autostart == false
+        let fx = e.handle(
+            Event::AutostartApplied {
+                requested: false,
+                ok: true,
+            },
+            1210,
+        );
+        assert_eq!(fx, vec![]);
+    }
+
+    /// Startup reconciliation: the registry wins over the config file.
+    #[test]
+    fn startup_reconciliation_adopts_the_os_value() {
+        let mut e = engine_after_initial();
+        let fx = e.handle(
+            Event::AutostartApplied {
+                requested: true,
+                ok: true,
+            },
+            5,
+        );
+        assert_eq!(fx, vec![Effect::PersistConfig]);
+        assert!(e.config().autostart);
+    }
+
+    #[test]
+    fn repeated_toggle_re_asserts_the_registry() {
+        let mut e = engine_after_initial();
+        e.handle(Event::SetAutostart(true), 1200);
+        e.handle(
+            Event::AutostartApplied {
+                requested: true,
+                ok: true,
+            },
+            1210,
+        );
+        let fx = e.handle(Event::SetAutostart(true), 1300);
         assert_eq!(
             fx,
-            vec![Effect::ApplyAutostart(true), Effect::PersistConfig]
+            vec![Effect::ApplyAutostart(true)],
+            "the Run key may have drifted, so a repeated toggle must re-assert it"
         );
-        assert!(e.config().autostart);
     }
 }

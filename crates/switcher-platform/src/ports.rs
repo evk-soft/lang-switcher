@@ -2,11 +2,27 @@
 //! because effects are dispatched from the core loop thread; implementations forward
 //! calls to their owning threads (e.g. via channels + window messages) internally.
 
-use crate::events::{BadgeImage, LangTag, LayoutId, Placement, Point};
+use crate::events::{BadgeImage, LangTag, LayoutId, Point, ResolvedAnchor};
 
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct PlatformError(pub String);
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{detail}")]
+pub struct PlatformError {
+    /// Stable machine key authored by the adapter ("registry_write_denied",
+    /// "hook_register_failed"). It lets the app build a `CapabilityReport` without
+    /// knowing a single thing about the OS — the alternative would be parsing `detail`,
+    /// which breaks on any wording change (ADR-0007).
+    pub code: &'static str,
+    pub detail: String,
+}
+
+impl PlatformError {
+    pub fn new(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
+        }
+    }
+}
 
 /// Streams `PlatformEvent::LayoutChanged` into the channel supplied at construction.
 pub trait LayoutMonitor: Send {
@@ -26,13 +42,27 @@ pub trait CaretLocator: Send {
     fn caret_point(&self) -> Option<Point>;
 }
 
-/// Click-through, topmost, non-activating badge window.
+/// Click-through, topmost, non-activating badge window. **Owns all badge geometry**
+/// (ADR-0005): the offset from the anchor point, the DPI scaling of that offset, the
+/// monitor chosen for `ResolvedAnchor::Fixed`, and clamping into that monitor's work
+/// area. The core never sees a pixel; the shell only picks how many of them to draw.
 pub trait OverlayWindow: Send {
-    fn show(&self, image: &BadgeImage, placement: Placement);
-    fn move_to(&self, pos: Point);
+    /// `image.dpi` should equal `self.dpi_for(anchor)`. If it does not, the badge is still
+    /// shown at the image's real pixel size — never clipped, never off screen — and
+    /// `PlatformEvent::OverlayScaleChanged` is emitted so the shell can re-render.
+    fn show(&self, image: &BadgeImage, anchor: ResolvedAnchor);
+
+    /// Re-place the visible badge. Never re-rasterizes: on a DPI mismatch it moves now
+    /// with the current pixel size and emits `OverlayScaleChanged`.
+    fn move_to(&self, anchor: ResolvedAnchor);
+
     fn hide(&self);
-    /// Effective DPI at a screen point (96 = 100%).
-    fn dpi_at(&self, pos: Point) -> u32;
+
+    /// Effective DPI (96 = 100%) of the monitor this adapter *would* place `anchor` on,
+    /// including the monitor it picks itself for `Fixed`. Answered **synchronously on the
+    /// caller's thread** — no hop into the overlay thread, otherwise the core loop would
+    /// deadlock against the overlay's message pump. Sole caller: the shell's rasterizer.
+    fn dpi_for(&self, anchor: ResolvedAnchor) -> u32;
 }
 
 pub trait Autostart: Send {
