@@ -9,9 +9,21 @@ license.workspace = true
 switcher-platform = { workspace = true }
 crossbeam-channel = { workspace = true }
 tracing = { workspace = true }
+# One feature per group of calls that needs it, added with the code that needs it
+# (ADR-0008). Removing any of these must break the build — that is the check.
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    # `WNDCLASSW` carries an `HBRUSH`, so the struct and `RegisterClassW` are gated on Gdi
+    # even though they live in WindowsAndMessaging.
+    "Win32_Graphics_Gdi",
+    # dpi.rs: SetProcessDpiAwarenessContext, GetDpiAwarenessContextForProcess,
+    # AreDpiAwarenessContextsEqual, GetAwarenessFromDpiAwarenessContext.
+    "Win32_UI_HiDpi",
+    # GetCurrentThreadId (win_util), GetCurrentProcess (dpi).
+    "Win32_System_Threading",
+    # GetModuleHandleW for the window class' HINSTANCE.
+    "Win32_System_LibraryLoader",
 ] }
 
 [lints]
