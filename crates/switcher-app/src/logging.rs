@@ -9,6 +9,8 @@ use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
+    #[error("could not create the log directory: {0}")]
+    Directory(#[from] std::io::Error),
     #[error("could not open the log: {0}")]
     File(#[from] tracing_appender::rolling::InitError),
     #[error("could not install the log subscriber: {0}")]
@@ -16,6 +18,9 @@ pub enum LogError {
 }
 
 pub fn init(log_dir: &Path, level: &str) -> Result<WorkerGuard, LogError> {
+    // The appender's retention scan runs before it creates the first log file.
+    // Pre-create the directory so a normal first launch does not print a false error.
+    std::fs::create_dir_all(log_dir)?;
     let appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix("lang-switcher")

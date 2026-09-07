@@ -44,6 +44,8 @@ pub struct TraySender {
     tx: Sender<TrayCommand>,
     #[cfg(windows)]
     waker: Option<switcher_windows::win_util::PumpWaker>,
+    #[cfg(windows)]
+    quit: Option<switcher_windows::quit_signal::QuitSignal>,
 }
 
 impl TraySender {
@@ -52,6 +54,8 @@ impl TraySender {
             tx,
             #[cfg(windows)]
             waker: None,
+            #[cfg(windows)]
+            quit: None,
         }
     }
     #[cfg(windows)]
@@ -60,8 +64,18 @@ impl TraySender {
         self
     }
     pub fn send(&self, command: TrayCommand) {
+        #[cfg(windows)]
+        let shutting_down = matches!(command, TrayCommand::Shutdown);
         if self.tx.send(command).is_err() {
             return;
+        }
+        #[cfg(windows)]
+        if shutting_down {
+            if let Some(quit) = &self.quit {
+                if let Err(error) = quit.request() {
+                    tracing::warn!(%error, "could not request native tray shutdown");
+                }
+            }
         }
         #[cfg(windows)]
         if let Some(waker) = &self.waker {
@@ -69,6 +83,12 @@ impl TraySender {
                 tracing::warn!(%error, "could not wake tray");
             }
         }
+    }
+
+    #[cfg(windows)]
+    pub fn with_quit_signal(mut self, quit: switcher_windows::quit_signal::QuitSignal) -> Self {
+        self.quit = Some(quit);
+        self
     }
 }
 
