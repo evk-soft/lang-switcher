@@ -2,6 +2,7 @@
 
 pub mod classify;
 mod snapshot;
+pub(crate) use snapshot::language_for;
 
 pub use snapshot::current;
 

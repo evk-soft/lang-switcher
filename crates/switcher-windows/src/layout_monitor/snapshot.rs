@@ -86,7 +86,7 @@ fn read_matching(
     )
 }
 
-pub(super) fn language_for(layout: LayoutId) -> LangTag {
+pub(crate) fn language_for(layout: LayoutId) -> LangTag {
     // GetKeyboardLayout documents the low word as LANGID. An LCID with sort ID
     // zero has exactly these low 16 bits (MAKELCID(langid, SORT_DEFAULT)).
     let langid = (layout.0 & 0xffff) as u32;
