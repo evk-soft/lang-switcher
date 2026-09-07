@@ -30,8 +30,8 @@
 | 8 | порты и ядро под ADR-0005…0008, урезание зависимостей | ✅ сделано | ветка `feat/m1-task8-contracts` |
 | 9 | фундамент: манифест PMv2, win_util, supervise | ✅ сделано | ветка `feat/m1-task9-foundation` |
 | 10 | overlay.rs + geometry.rs + overlay_smoke — **риск №1 (1/2)** | ✅ сделано | ветка `feat/m1-task10-overlay`; визуальные пункты чеклиста ждут человека |
-| 11 | pointer.rs (Raw Input): бейдж следует за курсором — **риск №1 (2/2)** | ✅ код и native-тесты; визуальный smoke ожидает проверки | этот коммит |
-| 12 | layout_monitor.rs: 2 источника + взводимый фолбэк — **риск №2** | ⬜ | |
+| 11 | pointer.rs (Raw Input): бейдж следует за курсором — **риск №1 (2/2)** | ✅ код и native-тесты; визуальный smoke ожидает проверки | `a1aa1f5` |
+| 12 | layout_monitor.rs: 2 источника + взводимый фолбэк — **риск №2** | ✅ код и native-тесты; доставка смен языка требует smoke | этот коммит |
 | 13 | tsf.rs — третий источник (STA/COM) | ⬜ | |
 | 14 | autostart.rs (HKCU\Run) | ⬜ | |
 | 15 | switcher-app — render.rs: растеризация и кэш бейджей | ⬜ | |
@@ -2302,6 +2302,8 @@ git commit -m "feat(windows): raw input pointer tracking armed only while the ba
 
 ### Задача 12: layout_monitor.rs + layout_smoke — риск №2
 
+**Реализовано 2026-09-07 в основной папке.** Пробник подтвердил регистрацию обоих хуков и shell-сообщения 6/32774; десять переключений языка и elevated-сценарий ещё не проверены. Shell получает `Degraded` до первого `HSHELL_LANGUAGE`. Актуальный код в `layout_monitor/` соблюдает ADR-0011 (нет чтения собственного потока при NULL foreground). Остановка и многоканальные отчёты супервизии зафиксированы в ADR-0012.
+
 **Файлы:**
 - Создать: `crates/switcher-windows/src/layout_monitor.rs` — поток раскладки: два источника + взводимый фолбэк-опрос, `impl LayoutMonitor`
 - Создать: `crates/switcher-windows/src/layout_monitor/classify.rs` — чистая лестница классификации переднего окна + табличные тесты
@@ -2338,7 +2340,7 @@ git commit -m "feat(windows): raw input pointer tracking armed only while the ba
 
 Результат записать в чеклист. Оба эксперимента можно и нужно сделать одним коммитом до основного кода — они дешёвые, а их итог меняет состав задачи.
 
-- [ ] **Шаг 3: табличные тесты лестницы классификации (red)**
+- [x] **Шаг 3: табличные тесты лестницы классификации (red)**
 
 `classify.rs`: `ForegroundFacts { tid: u32, is_own_process: bool, class_name: String, open_process: OpenOutcome, package: PackageOutcome }` и `decide(&ForegroundFacts) -> PollDecision`, где `PollDecision { Keep, Arm(&'static str), Disarm }`. Чистая функция: все факты ОС приходят аргументами, `unsafe` остаётся в добыче. Лестница из ADR-0007 §4, fail-safe в сторону взвода:
 
@@ -2358,26 +2360,26 @@ git commit -m "feat(windows): raw input pointer tracking armed only while the ba
 Запустить: `cargo test -p switcher-windows classify`
 Ожидание: FAIL — `decide` ещё `todo!("task 12")`.
 
-- [ ] **Шаг 4: реализовать `decide` и добычу фактов**
+- [x] **Шаг 4: реализовать `decide` и добычу фактов**
 
 Пробник — строго `OpenProcess(PROCESS_QUERY_INFORMATION, false, pid)` (`System/Threading/mod.rs:1192`), **не** `PROCESS_QUERY_LIMITED_INFORMATION`: Learn документирует последнее как намеренно ослабленное подмножество, доступное даже к protected processes, то есть как пробник оно бесполезно. Сопоставление ошибки — `WIN32_ERROR::from_error(&e) == Some(ERROR_ACCESS_DENIED)` (`extensions/Win32/Foundation/WIN32_ERROR.rs`, `ERROR_ACCESS_DENIED = WIN32_ERROR(5)`). Успешный хэндл обернуть в `windows::core::Owned<HANDLE>` (RAII, `impl Free for HANDLE` есть; путь через реэкспорт `windows::core`, чтобы не заводить прямую зависимость на `windows-core` ради одного типа) и передать в `GetPackageFullName(handle, &mut len, None) -> WIN32_ERROR` (`Storage/Packaging/Appx/mod.rs:206`): `APPMODEL_ERROR_NO_PACKAGE = 15700` ⇒ обычный desktop, `ERROR_INSUFFICIENT_BUFFER = 122` ⇒ упакованное приложение, иное ⇒ `probe_failed`. `IsImmersiveProcess` не использовать: в `windows-0.62.2` она сгенерирована как `BOOL → Result<()>`, поэтому `Err` неотличим от «не immersive».
 
 Запустить: `cargo test -p switcher-windows classify`
 Ожидание: PASS.
 
-- [ ] **Шаг 5: источник 2 — WinEvent-хук и приведение HKL к тегу языка**
+- [x] **Шаг 5: источник 2 — WinEvent-хук и приведение HKL к тегу языка**
 
 Поток раскладки: message-only окно + насос + `SetWinEventHook(EVENT_SYSTEM_FOREGROUND, …, WINEVENT_OUTOFCONTEXT)`, `UnhookWinEvent` в `Drop` (`:675`, `BOOL`). `WINEVENTPROC` — обычная `extern "system" fn` без захвата, поэтому `Sender<PlatformEvent>` держится в `thread_local!` этого потока; корректность этого приёма опирается на «колбэк исполняется на потоке-установщике, который качает сообщения» — формулировка **UNVERIFIED**, сверить по Learn перед кодом (скил `platform-api-work`), а фактически подтверждается напечатанным в шаге 2 `GetCurrentThreadId`.
 
-Раскладка на Windows per-thread, поэтому чтение — `GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), None))`; при нулевом HWND — `GetKeyboardLayout(0)`. `LayoutId` = `hkl.0 as usize as u64`. Тег языка: младшее слово HKL как LANGID → `LCIDToLocaleName(langid as u32, Some(&mut buf), 0) -> i32` (`Globalization/mod.rs:684`), ноль = отказ. Два предупреждения: «младшее слово HKL — это LANGID» и «LANGID годится как LCID» — **UNVERIFIED**, обязательны к сверке по Learn до кода; `LOCALE_NAME_MAX_LENGTH` в `windows-0.62.2` есть (`System/SystemServices/mod.rs:2785`, значение 85), но лежит за фичей `Win32_System_SystemServices`, которой в карте фич нет: тянуть целую фичу ради одной константы не обязательно — допустимо захардкодить 85 со ссылкой на это место. Отказ конверсии ⇒ `LangTag::new("")`, что ядро уже корректно превращает в метку `"??"` (тест `unknown_language_gets_uppercased_two_letter_label_and_fallback_bg`) — деградация без специального кода.
+Раскладка на Windows per-thread, поэтому чтение — `GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), None))`; при нулевом HWND — ошибка `foreground_unavailable`, без чтения потока 0 (ADR-0011). `LayoutId` = `hkl.0 as usize as u64`. Тег языка: младшее слово HKL как LANGID → `LCIDToLocaleName(langid as u32, Some(&mut buf), 0) -> i32` (`Globalization/mod.rs:684`), ноль = отказ. Два предупреждения: «младшее слово HKL — это LANGID» и «LANGID годится как LCID» — **UNVERIFIED**, обязательны к сверке по Learn до кода; `LOCALE_NAME_MAX_LENGTH` в `windows-0.62.2` есть (`System/SystemServices/mod.rs:2785`, значение 85), но лежит за фичей `Win32_System_SystemServices`, которой в карте фич нет: тянуть целую фичу ради одной константы не обязательно — допустимо захардкодить 85 со ссылкой на это место. Отказ конверсии ⇒ `LangTag::new("")`, что ядро уже корректно превращает в метку `"??"` (тест `unknown_language_gets_uppercased_two_letter_label_and_fallback_bg`) — деградация без специального кода.
 
 Событие уходит как `LayoutChanged { source: LayoutSource::ForegroundChange }`; дедуп ядра глотает повторы от других источников (тест `same_layout_from_another_source_is_deduplicated`), поэтому отправлять можно безусловно.
 
-- [ ] **Шаг 6: принять решение и записать ADR — супервизия потока с двумя возможностями**
+- [x] **Шаг 6: принять решение и записать ADR — супервизия потока с двумя возможностями**
 
 Пробел, который ADR-0007 оставил: `supervise::spawn_supervised(cap, tx, run)` принимает **одну** `Capability`, а поток раскладки по ADR-0009 хостит две (`LayoutShellHook` + `LayoutForegroundHook`) — при исчерпании бюджета вторая осталась бы в карте как `Ok`, будучи мёртвой. Не решать это молча. Варианты: (а) расширить внутренний хелпер до `&[Capability]` и слать `Off` по всем при исчерпании бюджета; (б) разнести источники на два потока, каждый со своим окном и своей супервизией (расходится с картой потоков ADR-0009). Выбрать, зафиксировать через скил `adr` (правка ADR-0007 либо новый ADR) и только потом писать проводку. Если шаг 1 показал, что shell hook мёртв, вопрос снимается сам — записать и это.
 
-- [ ] **Шаг 7: взводимый фолбэк-опрос 500 мс и три слоя наблюдаемости**
+- [x] **Шаг 7: взводимый фолбэк-опрос 500 мс и три слоя наблюдаемости**
 
 Решение о взводе принимается в обработчике уже существующего `EVENT_SYSTEM_FOREGROUND`, поэтому «решить, опрашивать ли» не стоит ни одного опроса. Механика: `SetTimer(Some(hwnd), IDT_FALLBACK, 500, None) -> usize` (ноль = отказ, `WAM:2238`) и `KillTimer(Some(hwnd), IDT_FALLBACK) -> Result<()>` (`:1365`) на окне **потока раскладки** (ADR-0009); в `WM_TIMER` (`= 275`, `:7128`) — то же чтение, что в шаге 5, с `source: LayoutSource::ForegroundPoll`. Взвод/снятие идемпотентны: повторный `Arm` при уже взведённом таймере ничего не делает и ничего не логирует.
 
@@ -2393,7 +2395,7 @@ git commit -m "feat(windows): raw input pointer tracking armed only while the ba
 Запустить: `cargo run -p switcher-windows --example layout_smoke`
 Ожидание, по пунктам чеклиста (секция «Раскладка» в `docs/smoke/m1-windows.md`): переключение в Блокноте даёт событие с временем < 300 мс и **без** `ForegroundPoll`; переключение фокуса между окнами с разными раскладками даёт `ForegroundChange`; в elevated `cmd` и в UWP-приложении — событие приходит (источник записать, для этого и печатается), а взвод/снятие опроса видны ровно двумя строками `info!`; после возврата фокуса в Блокнот `typeperf` показывает ноль переключений контекста. Имена классов окон из шага 3 подтвердить в Spy++ и записать фактические.
 
-- [ ] **Шаг 9: гейты и коммит**
+- [x] **Шаг 9: гейты и коммит**
 
 Запустить: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check`
 Ожидание: чисто.

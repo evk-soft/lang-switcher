@@ -21,14 +21,18 @@
 
 use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender, bounded};
 use switcher_platform::events::{Capability, CapabilityReport, CapabilityState, PlatformEvent};
 use switcher_platform::ports::PlatformError;
 
-use crate::win_util::post_quit;
+use crate::win_util::{
+    PumpWaker, current_thread_id, discard_previous_quit, ensure_message_queue, post_quit,
+};
 
 /// Delay before each restart attempt. Three restarts inside ~5.25 s: a transient (an
 /// `explorer.exe` restart taking the shell hook with it) recovers on the first or second,
@@ -137,32 +141,109 @@ pub fn callback_panic_outcome() -> Result<(), PlatformError> {
 /// Returns an error rather than panicking when the OS refuses a thread, because the whole
 /// point of this module is degrading instead of dying (ADR-0007).
 pub fn spawn_supervised<F>(
-    cap: Capability,
+    capabilities: &'static [Capability],
     tx: Sender<PlatformEvent>,
     run: F,
-) -> Result<JoinHandle<()>, PlatformError>
+) -> Result<SupervisedThread, PlatformError>
 where
-    F: Fn(&Sender<PlatformEvent>) -> Result<(), PlatformError> + Send + 'static,
+    F: Fn(&Sender<PlatformEvent>, &StopToken) -> Result<(), PlatformError> + Send + 'static,
 {
-    std::thread::Builder::new()
-        .name(format!("switcher-{}", cap.key()))
-        .spawn(move || supervise_loop(cap, tx, run))
-        .map_err(|e| {
-            PlatformError::new(
-                "supervised_thread_spawn_failed",
-                format!("could not spawn the {} thread: {e}", cap.key()),
-            )
+    let Some(first) = capabilities.first() else {
+        return Err(PlatformError::new(
+            "empty_capabilities",
+            "a source thread must own a capability",
+        ));
+    };
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (stop_tx, stop_rx) = bounded(1);
+    let token = StopToken {
+        stopped: Arc::clone(&stopped),
+        receiver: stop_rx,
+    };
+    let (ready_tx, ready_rx) = bounded(1);
+    let join = std::thread::Builder::new()
+        .name(format!("switcher-{}", first.key()))
+        .spawn(move || {
+            ensure_message_queue();
+            if ready_tx.send(current_thread_id()).is_err() {
+                return;
+            }
+            supervise_loop(capabilities, tx, &token, run);
         })
+        .map_err(|e| PlatformError::new("supervised_thread_spawn_failed", e.to_string()))?;
+    match ready_rx.recv() {
+        Ok(thread_id) => Ok(SupervisedThread {
+            stopped,
+            stop_tx,
+            waker: PumpWaker::new(thread_id),
+            join: Some(join),
+        }),
+        Err(error) => {
+            let _ = join.join();
+            Err(PlatformError::new(
+                "supervised_thread_died",
+                error.to_string(),
+            ))
+        }
+    }
 }
 
-fn supervise_loop<F>(cap: Capability, tx: Sender<PlatformEvent>, run: F)
-where
-    F: Fn(&Sender<PlatformEvent>) -> Result<(), PlatformError>,
+/// Native pumps inspect this only when woken; backoff waits on its channel (ADR-0012).
+#[derive(Debug)]
+pub struct StopToken {
+    stopped: Arc<AtomicBool>,
+    receiver: Receiver<()>,
+}
+
+impl StopToken {
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+pub struct SupervisedThread {
+    stopped: Arc<AtomicBool>,
+    stop_tx: Sender<()>,
+    waker: PumpWaker,
+    join: Option<JoinHandle<()>>,
+}
+
+impl SupervisedThread {
+    pub fn shutdown(&mut self) {
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        self.stopped.store(true, Ordering::Release);
+        let _ = self.stop_tx.try_send(());
+        // The queue is established before construction returns. If it has already
+        // gone away the thread finished; if it is full, the next iteration sees stop.
+        let _ = self.waker.wake();
+        if join.join().is_err() {
+            tracing::error!("supervised thread panicked outside its run body");
+        }
+    }
+}
+
+impl Drop for SupervisedThread {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn supervise_loop<F>(
+    capabilities: &[Capability],
+    tx: Sender<PlatformEvent>,
+    stop: &StopToken,
+    run: F,
+) where
+    F: Fn(&Sender<PlatformEvent>, &StopToken) -> Result<(), PlatformError>,
 {
     let mut budget = RestartBudget::new();
     let mut attempt = 0usize;
 
-    loop {
+    while !stop.is_stopped() {
+        discard_previous_quit();
         // Start each attempt with a clean slate. Without this a panic whose flag was never
         // consumed — because the body returned early for some other reason — would leak
         // into the *next* attempt and turn a legitimate clean exit into a restart.
@@ -171,9 +252,14 @@ where
         let started = Instant::now();
         // `AssertUnwindSafe` because `Sender` is not `UnwindSafe`. That is acceptable here:
         // a panic cannot leave the channel in a torn state, it can only drop a message.
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| run(&tx)));
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| run(&tx, stop)));
+        let callback_outcome = callback_panic_outcome();
         let ran_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+        if stop.is_stopped() {
+            return;
+        }
+        let outcome = outcome.map(|result| result.and(callback_outcome));
         let reason = match outcome {
             Ok(Ok(())) => return,
             Ok(Err(e)) => format!("{}: {}", e.code, e.detail),
@@ -185,28 +271,60 @@ where
             Some(delay_ms) => {
                 tracing::warn!(
                     target: "switcher_windows::supervise",
-                    cap = cap.key(), attempt, ran_ms, delay_ms, reason = %reason,
+                    ?capabilities, attempt, ran_ms, delay_ms, reason = %reason,
                     "supervised thread ended; restarting after backoff"
                 );
-                std::thread::sleep(Duration::from_millis(delay_ms));
+                report_failure(
+                    &tx,
+                    capabilities,
+                    CapabilityState::Degraded,
+                    "source_restart_pending",
+                    &reason,
+                );
+                if stop
+                    .receiver
+                    .recv_timeout(Duration::from_millis(delay_ms))
+                    .is_ok()
+                    || stop.is_stopped()
+                {
+                    return;
+                }
             }
             None => {
                 tracing::error!(
                     target: "switcher_windows::supervise",
-                    cap = cap.key(), attempt, ran_ms, reason = %reason,
+                    ?capabilities, attempt, ran_ms, reason = %reason,
                     "restart budget exhausted; capability is off for the rest of this run"
                 );
                 // Same channel as every other event: ordering against LayoutChanged is
                 // meaningful, so a second channel would be wrong (ADR-0007).
-                let _ = tx.send(PlatformEvent::CapabilityChanged(CapabilityReport {
-                    capability: cap,
-                    state: CapabilityState::Off,
-                    code: "restart_budget_exhausted",
-                    detail: reason,
-                }));
+                report_failure(
+                    &tx,
+                    capabilities,
+                    CapabilityState::Off,
+                    "restart_budget_exhausted",
+                    &reason,
+                );
                 return;
             }
         }
+    }
+}
+
+fn report_failure(
+    tx: &Sender<PlatformEvent>,
+    capabilities: &[Capability],
+    state: CapabilityState,
+    code: &'static str,
+    detail: &str,
+) {
+    for &capability in capabilities {
+        let _ = tx.send(PlatformEvent::CapabilityChanged(CapabilityReport {
+            capability,
+            state,
+            code,
+            detail: detail.into(),
+        }));
     }
 }
 
@@ -223,6 +341,120 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_interrupts_backoff_and_covers_all_capabilities() {
+        let (events, received) = crossbeam_channel::unbounded();
+        let mut worker = spawn_supervised(
+            &[
+                Capability::LayoutShellHook,
+                Capability::LayoutForegroundHook,
+            ],
+            events,
+            |_, _| {
+                Err(PlatformError::new(
+                    "test_failure",
+                    "intentional setup failure",
+                ))
+            },
+        )
+        .expect("spawn supervised worker");
+        // The third failed attempt starts the four-second backoff. Each failure
+        // must mark BOTH capabilities degraded before waiting.
+        for _ in 0..3 {
+            for capability in [
+                Capability::LayoutShellHook,
+                Capability::LayoutForegroundHook,
+            ] {
+                let event = received
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("failure report");
+                let PlatformEvent::CapabilityChanged(report) = event else {
+                    panic!("unexpected event");
+                };
+                assert_eq!(report.capability, capability);
+                assert_eq!(report.state, CapabilityState::Degraded);
+            }
+        }
+        let started = Instant::now();
+        worker.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown must interrupt four-second backoff"
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "stopping is not another failure"
+        );
+    }
+
+    #[test]
+    fn stop_wakes_a_blocked_native_pump() {
+        use crate::win_util::{PumpHandler, PumpVerdict, pump_with_handler};
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        struct Waiting<'a>(&'a StopToken);
+        impl PumpHandler for Waiting<'_> {
+            fn should_stop(&self) -> bool {
+                self.0.is_stopped()
+            }
+            fn on_thread_message(&mut self, _: u32, _: WPARAM, _: LPARAM) -> PumpVerdict {
+                PumpVerdict::Continue
+            }
+        }
+        let (events, _) = crossbeam_channel::unbounded();
+        let (entered, ready) = crossbeam_channel::bounded(1);
+        let (exited, done) = crossbeam_channel::bounded(1);
+        let mut worker = spawn_supervised(&[Capability::LayoutTsf], events, move |_, stop| {
+            entered.send(()).expect("announce pump");
+            pump_with_handler("test-cancel", &mut Waiting(stop))?;
+            exited.send(()).expect("announce pump exit");
+            Ok(())
+        })
+        .expect("spawn pump");
+        ready
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pump entered");
+        worker.shutdown();
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("native loop completed");
+    }
+
+    #[test]
+    fn quit_from_failed_setup_does_not_terminate_the_next_attempt() {
+        use std::sync::atomic::AtomicUsize;
+        use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW};
+        let calls = AtomicUsize::new(0);
+        let (events, _) = crossbeam_channel::unbounded();
+        let (result, received) = bounded(1);
+        let mut worker = spawn_supervised(&[Capability::LayoutTsf], events, move |_, _| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                PumpWaker::new(current_thread_id())
+                    .wake()
+                    .expect("ordinary message before quit");
+                guard_callback(
+                    Capability::LayoutTsf,
+                    || (),
+                    || panic!("callback during setup"),
+                );
+                return Err(PlatformError::new(
+                    "setup_failed",
+                    "before the pump started",
+                ));
+            }
+            let mut message = MSG::default();
+            // SAFETY: live output; inspect this isolated worker's queue without removal.
+            let stale = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE) }.as_bool();
+            result.send(stale).expect("publish queue observation");
+            Ok(())
+        })
+        .expect("spawn worker");
+        assert!(
+            !received
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second attempt")
+        );
+        worker.shutdown();
+    }
 
     #[test]
     fn backoff_walks_the_schedule_then_gives_up() {
