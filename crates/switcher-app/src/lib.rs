@@ -10,4 +10,6 @@ pub mod paths;
 pub mod render;
 pub mod runtime;
 pub mod sound;
+#[cfg(windows)]
+pub mod startup;
 pub mod tray;
