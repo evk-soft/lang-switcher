@@ -26,7 +26,10 @@ impl PlatformError {
 
 /// Streams `PlatformEvent::LayoutChanged` into the channel supplied at construction.
 pub trait LayoutMonitor: Send {
-    /// One-shot read of the current layout (used at startup for the Initial event).
+    /// Synchronous snapshot of the current foreground layout at call time, including
+    /// when called from the runtime thread. Used at startup and on each layout
+    /// notification; `LayoutId` and `LangTag` must describe the same read (ADR-0011).
+    /// On error the runtime retains its last accepted state, never a queued payload.
     fn current(&self) -> Result<(LayoutId, LangTag), PlatformError>;
 }
 

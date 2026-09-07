@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
 use serde::{Deserialize, Serialize};
+use switcher_platform::events::LangTag;
 
 use crate::content::{BadgeStyle, parse_hex_rgb};
 
@@ -167,28 +168,30 @@ impl Config {
             ));
             self.sound.volume = self.sound.volume.clamp(0.0, 1.0);
         }
-        // Keys are looked up by `LangTag::primary()`, which lower-cases, so an upper-case
-        // key would validate cleanly and then never match anything — the same silent-typo
-        // class the two enum fields below are normalized for.
-        let mixed_case: Vec<String> = self
+        // Match the content lookup exactly: case and region aliases must resolve to the
+        // primary subtag. An already canonical key wins any collision; other aliases
+        // are processed in BTreeMap order so the result is deterministic.
+        let aliases: Vec<(String, String)> = self
             .badge
             .colors
             .keys()
-            .filter(|lang| lang.chars().any(|c| c.is_ascii_uppercase()))
-            .cloned()
+            .filter_map(|lang| {
+                let primary = LangTag::new(lang.as_str()).primary();
+                (primary != *lang).then(|| (lang.clone(), primary))
+            })
             .collect();
-        for lang in mixed_case {
+        for (lang, primary) in aliases {
             let Some(hex) = self.badge.colors.remove(&lang) else {
                 continue;
             };
-            match self.badge.colors.entry(lang.to_ascii_lowercase()) {
+            match self.badge.colors.entry(primary) {
                 Entry::Occupied(taken) => warnings.push(format!(
                     "badge.colors.{lang}: duplicates {}, dropped in favour of it",
                     taken.key()
                 )),
                 Entry::Vacant(slot) => {
                     warnings.push(format!(
-                        "badge.colors.{lang}: keys are matched lower-case, renamed to {}",
+                        "badge.colors.{lang}: keys are matched by primary language, renamed to {}",
                         slot.key()
                     ));
                     slot.insert(hex);
@@ -379,5 +382,31 @@ mod tests {
     fn unknown_fields_are_ignored() {
         let (cfg, _) = Config::from_toml_str("future_field = 42\n").unwrap();
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn full_language_color_keys_apply_to_badge_content() {
+        let (cfg, warnings) =
+            Config::from_toml_str("[badge.colors]\nru-RU = \"#123456\"\nEN_us = \"#654321\"\n")
+                .unwrap();
+        assert_eq!(warnings.len(), 2);
+        for (tag, expected) in [("ru-RU", "#123456"), ("en-US", "#654321")] {
+            let content = crate::content::BadgeContent::for_lang(
+                &switcher_platform::events::LangTag::new(tag),
+                cfg.badge.style,
+                &cfg.badge.colors,
+            );
+            assert_eq!(Some(content.bg), parse_hex_rgb(expected));
+        }
+    }
+
+    #[test]
+    fn primary_color_key_wins_over_region_alias() {
+        let (cfg, warnings) =
+            Config::from_toml_str("[badge.colors]\nru = \"#123456\"\nru-RU = \"#654321\"\n")
+                .unwrap();
+        assert_eq!(cfg.badge.colors.len(), 1);
+        assert_eq!(cfg.badge.colors["ru"], "#123456");
+        assert_eq!(warnings.len(), 1);
     }
 }

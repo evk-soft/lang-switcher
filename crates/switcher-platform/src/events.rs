@@ -40,7 +40,8 @@ pub enum LayoutSource {
     ForegroundChange,
     ForegroundPoll,
     Tsf,
-    /// One-shot read at startup: updates the tray but never shows a badge or plays a sound.
+    /// One-shot startup read: updates the tray, restores a Follow badge, and never plays
+    /// a sound or shows a transient badge.
     Initial,
 }
 
@@ -146,6 +147,9 @@ pub struct CapabilityReport {
 /// Flat events adapters push into the app channel. Data only — no handles, no callbacks.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlatformEvent {
+    /// Notification plus the source's observed snapshot. The runtime re-reads
+    /// `LayoutMonitor::current()` before feeding the core: queued observations can be
+    /// stale. `source` remains trigger provenance (ADR-0011).
     LayoutChanged {
         layout: LayoutId,
         lang: LangTag,

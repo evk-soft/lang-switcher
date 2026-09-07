@@ -7,12 +7,10 @@ use switcher_platform::ports::SoundCue;
 use crate::config::{AnchorPref, BadgeMode, Config};
 use crate::content::{BadgeContent, cue_for};
 
-/// A source reporting the layout we just switched AWAY from within this window
-/// is treated as a stale echo of the same physical switch, not a new switch.
-pub const STALE_ECHO_WINDOW_MS: u64 = 150;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
+    /// A current snapshot confirmed by the runtime when processing a platform
+    /// notification, not the notification's potentially delayed payload (ADR-0011).
     Layout {
         layout: LayoutId,
         lang: LangTag,
@@ -95,8 +93,6 @@ enum BadgeState {
 pub struct Engine {
     cfg: Config,
     layout: Option<(LayoutId, LangTag)>,
-    prev_layout: Option<LayoutId>,
-    last_change_ms: u64,
     badge: BadgeState,
 }
 
@@ -105,8 +101,6 @@ impl Engine {
         Self {
             cfg,
             layout: None,
-            prev_layout: None,
-            last_change_ms: 0,
             badge: BadgeState::Hidden,
         }
     }
@@ -115,13 +109,13 @@ impl Engine {
         &self.cfg
     }
 
-    pub fn handle(&mut self, event: Event, now_ms: u64) -> Vec<Effect> {
+    pub fn handle(&mut self, event: Event, _now_ms: u64) -> Vec<Effect> {
         match event {
             Event::Layout {
                 layout,
                 lang,
                 source,
-            } => self.on_layout(layout, lang, source, now_ms),
+            } => self.on_layout(layout, lang, source),
             Event::AnchorResolved { caret, cursor } => self.on_anchor(caret, cursor),
             // `tracking` is only ever true for a cursor-anchored badge (see `on_anchor`),
             // so the anchor kind here is always `Cursor`.
@@ -168,24 +162,11 @@ impl Engine {
         }
     }
 
-    fn on_layout(
-        &mut self,
-        layout: LayoutId,
-        lang: LangTag,
-        source: LayoutSource,
-        now_ms: u64,
-    ) -> Vec<Effect> {
+    fn on_layout(&mut self, layout: LayoutId, lang: LangTag, source: LayoutSource) -> Vec<Effect> {
         if self.layout.as_ref().map(|(id, _)| *id) == Some(layout) {
             return vec![];
         }
-        let stale_echo = self.prev_layout == Some(layout)
-            && now_ms.saturating_sub(self.last_change_ms) < STALE_ECHO_WINDOW_MS;
-        if stale_echo {
-            return vec![];
-        }
-        self.prev_layout = self.layout.take().map(|(id, _)| id);
         self.layout = Some((layout, lang.clone()));
-        self.last_change_ms = now_ms;
 
         let content = BadgeContent::for_lang(&lang, self.cfg.badge.style, &self.cfg.badge.colors);
         let mut fx = vec![Effect::UpdateTray {
@@ -193,6 +174,10 @@ impl Engine {
             lang: lang.clone(),
         }];
         if source == LayoutSource::Initial {
+            if self.cfg.badge.mode == BadgeMode::Follow {
+                self.badge = BadgeState::AwaitingAnchor;
+                fx.push(Effect::QueryAnchor);
+            }
             return fx;
         }
         // Superseding a still-visible transient badge: cancel its pending hide timer so
@@ -319,6 +304,44 @@ mod tests {
     }
 
     #[test]
+    fn initial_layout_shows_persisted_follow_badge_without_sound() {
+        let mut cfg = Config::default();
+        cfg.badge.mode = BadgeMode::Follow;
+        let mut e = Engine::new(cfg);
+        assert_eq!(
+            e.handle(layout(EN_ID, en(), LayoutSource::Initial), 0),
+            vec![
+                Effect::UpdateTray {
+                    label: "EN".to_owned(),
+                    lang: en()
+                },
+                Effect::QueryAnchor,
+            ]
+        );
+        assert_eq!(
+            e.handle(resolved(None, Some(p(10, 20))), 0),
+            vec![
+                Effect::ShowBadge {
+                    content: default_content(&en()),
+                    anchor: ResolvedAnchor::Cursor(p(10, 20)),
+                },
+                Effect::SetPointerTracking(true),
+                Effect::CancelHideTimer,
+            ]
+        );
+    }
+
+    #[test]
+    fn follow_selected_before_initial_layout_shows_on_initial() {
+        let mut e = Engine::new(Config::default());
+        e.handle(Event::SetMode(BadgeMode::Follow), 0);
+        assert!(
+            e.handle(layout(EN_ID, en(), LayoutSource::Initial), 1)
+                .contains(&Effect::QueryAnchor)
+        );
+    }
+
+    #[test]
     fn layout_change_updates_tray_plays_sound_and_queries_anchor() {
         let mut e = engine_after_initial();
         let fx = e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
@@ -356,15 +379,33 @@ mod tests {
     }
 
     #[test]
-    fn stale_echo_of_previous_layout_within_window_is_ignored() {
-        let mut e = engine_after_initial();
-        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
-        let fx = e.handle(layout(EN_ID, en(), LayoutSource::ForegroundChange), 1100);
-        assert_eq!(fx, vec![]);
+    fn rapid_return_to_previous_layout_is_accepted_from_every_source() {
+        for source in [
+            LayoutSource::ShellHook,
+            LayoutSource::ForegroundChange,
+            LayoutSource::ForegroundPoll,
+            LayoutSource::Tsf,
+        ] {
+            let mut e = engine_after_initial();
+            e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
+            let fx = e.handle(layout(EN_ID, en(), source), 1100);
+            assert!(
+                fx.contains(&Effect::UpdateTray {
+                    label: "EN".to_owned(),
+                    lang: en()
+                }),
+                "a confirmed return from {source:?} must update the indicator"
+            );
+            let shown = e.handle(resolved(None, Some(p(10, 20))), 1100);
+            assert!(shown.contains(&Effect::ShowBadge {
+                content: default_content(&en()),
+                anchor: ResolvedAnchor::Cursor(p(10, 20)),
+            }));
+        }
     }
 
     #[test]
-    fn toggle_back_after_stale_window_is_accepted() {
+    fn later_return_to_previous_layout_is_accepted() {
         let mut e = engine_after_initial();
         e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
         let fx = e.handle(layout(EN_ID, en(), LayoutSource::ShellHook), 1150);
