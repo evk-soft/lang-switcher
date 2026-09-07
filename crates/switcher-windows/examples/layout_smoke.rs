@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use switcher_platform::events::PlatformEvent;
 use switcher_platform::ports::LayoutMonitor;
 use switcher_windows::layout_monitor::LayoutHooks;
+use switcher_windows::tsf::TsfSource;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -12,7 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let started = Instant::now();
     let (events, received) = crossbeam_channel::unbounded();
-    let monitor = LayoutHooks::new(events)?;
+    let monitor = LayoutHooks::new(events.clone())?;
+    let _tsf = TsfSource::new(events)?;
     tracing::info!(snapshot = ?monitor.current(), "startup snapshot");
     let seconds = std::env::args()
         .nth(1)

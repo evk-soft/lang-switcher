@@ -31,8 +31,8 @@
 | 9 | фундамент: манифест PMv2, win_util, supervise | ✅ сделано | ветка `feat/m1-task9-foundation` |
 | 10 | overlay.rs + geometry.rs + overlay_smoke — **риск №1 (1/2)** | ✅ сделано | ветка `feat/m1-task10-overlay`; визуальные пункты чеклиста ждут человека |
 | 11 | pointer.rs (Raw Input): бейдж следует за курсором — **риск №1 (2/2)** | ✅ код и native-тесты; визуальный smoke ожидает проверки | `a1aa1f5` |
-| 12 | layout_monitor.rs: 2 источника + взводимый фолбэк — **риск №2** | ✅ код и native-тесты; доставка смен языка требует smoke | этот коммит |
-| 13 | tsf.rs — третий источник (STA/COM) | ⬜ | |
+| 12 | layout_monitor.rs: 2 источника + взводимый фолбэк — **риск №2** | ✅ код и native-тесты; доставка смен языка требует smoke | `53a397a` |
+| 13 | tsf.rs — третий источник (STA/COM) | ✅ код и native-тесты; глобальная доставка требует smoke | этот коммит |
 | 14 | autostart.rs (HKCU\Run) | ⬜ | |
 | 15 | switcher-app — render.rs: растеризация и кэш бейджей | ⬜ | |
 | 16 | switcher-app — sound.rs: синтез двух кью | ⬜ | |
@@ -2409,6 +2409,8 @@ git commit -m "feat(windows): layout sources with armed foreground fallback poll
 
 ### Задача 13: tsf.rs — третий источник раскладки (COM/STA)
 
+**Реализовано 2026-09-07.** Выбран `ITfInputProcessorProfileActivationSink`, прямой windows-core 0.62.2; контракт и отказ от автоматической agility — ADR-0013. Четыре теста TSF прошли. 45-секундный прогон на пользовательском desktop подтвердил подписку/завершение; глобальная доставка смен RU/EN пока не проверена.
+
 **Файлы:**
 - Создать: `crates/switcher-windows/src/tsf.rs` — STA-поток, COM-синк, RAII времени жизни
 - Изменить: `crates/switcher-windows/src/lib.rs` — `pub mod tsf;`
@@ -2422,7 +2424,7 @@ git commit -m "feat(windows): layout sources with armed foreground fallback poll
 - Потребляет: задачу 12 — читатель «HKL → (LayoutId, LangTag)» переиспользуется как есть; `Capability::LayoutTsf`, `supervise::spawn_supervised`.
 - Производит: `tsf::TsfSource::new(tx) -> Result<TsfSource, PlatformError>` — третий поставщик `LayoutChanged { source: LayoutSource::Tsf }`.
 
-- [ ] **Шаг 1: сверка контракта TSF — до единой строки кода**
+- [x] **Шаг 1: сверка контракта TSF — до единой строки кода**
 
 Контракт TSF в исследовании M1 **не проверялся**. Перед кодом обязательна сверка по vendor-документации (скил `platform-api-work`; context7 в этой сессии недоступен — использовать learn.microsoft.com и вендоренные исходники). Что именно сверить, по пунктам:
 
@@ -2441,13 +2443,13 @@ git commit -m "feat(windows): layout sources with armed foreground fallback poll
 
 Ожидание: короткая записка с ответами и ссылками — в теле коммита или в `docs/smoke/m1-windows.md`.
 
-- [ ] **Шаг 2: выбрать синк и записать ADR**
+- [x] **Шаг 2: выбрать синк и записать ADR**
 
 ADR-0009 в карте потоков называет `ITfActiveLanguageProfileNotifySink`. Проверенные подписи показывают, что `ITfInputProcessorProfileActivationSink` доставляет `langid` и `hkl` прямо в колбэк, тогда как названный в ADR — нет и потребовал бы второго чтения через читатель задачи 12. Это выбор платформенной техники, значит — правило 6 CLAUDE.md: выбрать по итогам шага 1 и **записать через скил `adr`** (правка ADR-0009 либо новый ADR со следующим свободным номером), и только затем писать код. Не решать молча ни в ту, ни в другую сторону.
 
 Ожидание: в `docs/architecture/adr/` лежит зафиксированное решение с обоснованием; карта потоков в ADR-0009 согласована с ним.
 
-- [ ] **Шаг 3а: сделать `windows-core` прямой зависимостью — иначе `#[implement]` не соберётся**
+- [x] **Шаг 3а: сделать `windows-core` прямой зависимостью — иначе `#[implement]` не соберётся**
 
 Макрос `implement` раскрывается в **абсолютные** пути `::windows_core::…` (`windows-implement-0.60.2/src/gen.rs`), а абсолютный путь требует крейт в extern prelude, то есть прямую строку в `Cargo.toml`. Сейчас `windows-core` только транзитивный (`Cargo.lock`), у `switcher-windows` в зависимостях его нет. Добавить в `[workspace.dependencies]` строку `windows-core = { version = "0.62", default-features = false, features = ["std"] }` и в `[target.'cfg(windows)'.dependencies]` крейта — `windows-core = { workspace = true }`. Версия обязана совпадать с той, что тянет `windows` 0.62, иначе в графе окажутся два `windows-core` и типы перестанут совпадать; проверить `cargo tree -p switcher-windows -i windows-core` — должна быть ровно одна версия.
 
@@ -2456,7 +2458,7 @@ ADR-0009 в карте потоков называет `ITfActiveLanguageProfile
 Запустить: `cargo tree -p switcher-windows -i windows-core`
 Ожидание: одна версия, 0.62.x.
 
-- [ ] **Шаг 3: STA-поток и правило «MTA в процессе нет»**
+- [x] **Шаг 3: STA-поток и правило «MTA в процессе нет»**
 
 Поток TSF поднимается отдельно и инициализирует COM как STA: `CoInitializeEx(None, COINIT_APARTMENTTHREADED) -> HRESULT`. `S_OK` и `S_FALSE` — успех; каждый такой вызов требует одного `CoUninitialize` на том же потоке после освобождения интерфейсов. **`RPC_E_CHANGED_MODE` — ошибка:** требуемый STA не установлен. Вернуть `PlatformError::new("com_init_failed", …)`, не создавать синк и не вызывать `CoUninitialize` за неудачную попытку. Исправлено по [контракту Microsoft](https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-coinitializeex). Проверить ветви `S_OK`, `S_FALSE`, `RPC_E_CHANGED_MODE` и прочей ошибки на границе RAII-гарда.
 
@@ -2464,7 +2466,7 @@ TSF получает собственный STA-поток по ADR-0009. Пов
 
 Насос `GetMessageW` на этом потоке держать по умолчанию (правило проекта; необходимость подтверждается шагом 1).
 
-- [ ] **Шаг 4: синк, его время жизни и отправка события**
+- [x] **Шаг 4: синк, его время жизни и отправка события**
 
 Реализация синка — `#[windows_core::implement(<выбранный интерфейс>)]` над структурой, хранящей `Sender<PlatformEvent>` (плоские данные, никаких HWND). В колбэке: собрать `LayoutChanged { layout, lang, source: LayoutSource::Tsf }` и отправить; при выбранном `ITfActiveLanguageProfileNotifySink` — предварительно прочитать раскладку читателем задачи 12 (синк говорит «когда», читатель — «что»); при `ITfInputProcessorProfileActivationSink` — взять `hkl`/`langid` из аргументов. Дедуп ядра уже гасит совпадения с двумя другими источниками.
 
@@ -2482,7 +2484,7 @@ RAII обязательна и парна: гард держит cookie от `Ad
 Запустить: `cargo run -p switcher-windows --example layout_smoke`, переключить раскладку 10 раз в Блокноте, затем в Word/браузере (полноценный TSF-клиент)
 Ожидание: строки с `source=Tsf` появляются, и по времени они либо опережают, либо догоняют `ForegroundChange` — обе картины валидны, важно, что источник не молчит. Ноль строк `source=Tsf` на 10 переключений ⇒ выбранный синк не покрывает переключение раскладки: вернуться к шагу 1, а не «дожимать» код. Отдельный пункт чеклиста: при завершении примера нет ни зависания на выходе, ни сообщений COM в отладочном выводе — это наблюдаемое доказательство парности `Drop`.
 
-- [ ] **Шаг 6: гейты и коммит**
+- [x] **Шаг 6: гейты и коммит**
 
 Запустить: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check`
 Ожидание: чисто.

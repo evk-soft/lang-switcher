@@ -33,6 +33,7 @@ rodio = { version = "0.22", default-features = false, features = ["playback"] }
 tray-icon = { version = "0.24", default-features = false }
 # The only default feature of `windows` is `std`, and it is needed.
 windows = "0.62"
+windows-core = { version = "0.62", default-features = false, features = ["std"] }
 
 # NOTE (ADR-0007): `panic = "abort"` is forbidden in every profile — it is a PRECONDITION
 # of the hook-thread supervisor, not the whole mechanism. `catch_unwind` around a thread
