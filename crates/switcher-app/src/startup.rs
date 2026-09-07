@@ -126,6 +126,13 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         }
     };
     tracing::info!(?dpi_report, config = %loaded.store.path().display(), "lang-switcher starting");
+    if !dpi_report.from_manifest {
+        // The adapter ran before logging was initialized, so repeat its diagnosis.
+        tracing::warn!(
+            ?dpi_report,
+            "DPI manifest did not provide Per-Monitor-V2; runtime fallback was required"
+        );
+    }
     if !dpi_report.per_monitor_v2 {
         warnings.push((
             "dpi_awareness",
