@@ -26,6 +26,9 @@ windows = { workspace = true, features = [
     "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
     "Win32_UI_TextServices",
+    "Win32_System_Registry",
+    # RegCreateKeyExW includes SECURITY_ATTRIBUTES, even when supplied as None.
+    "Win32_Security",
     # `WNDCLASSW` carries an `HBRUSH`, so the struct and `RegisterClassW` are gated on Gdi
     # even though they live in WindowsAndMessaging.
     "Win32_Graphics_Gdi",
