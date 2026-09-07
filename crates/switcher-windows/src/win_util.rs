@@ -220,7 +220,41 @@ pub enum PumpVerdict {
 /// everything posted with [`PumpThread::post`] arrives here instead, because a message
 /// with a NULL `hwnd` cannot be dispatched to a window at all.
 pub trait PumpHandler {
+    /// Checked between messages and before blocking; cancellation wakes the queue.
+    fn should_stop(&self) -> bool {
+        false
+    }
     fn on_thread_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> PumpVerdict;
+}
+
+/// Establish the message queue before another thread is allowed to wake this one.
+pub(crate) fn ensure_message_queue() {
+    let mut probe = MSG::default();
+    // SAFETY: live MSG, no queue entries removed. This is Microsoft's documented
+    // PostThreadMessage handshake: a User call creates the calling thread's queue.
+    let _ = unsafe { PeekMessageW(&mut probe, None, WM_USER, WM_USER, PM_NOREMOVE) };
+}
+
+/// A callback can fail during setup before a pump consumes its PostQuitMessage.
+/// Clear the previous attempt's queue only after ALL of its native owners are gone.
+/// WM_QUIT is synthesized after ordinary posts: filtering only for quit leaves a
+/// latent quit behind an old wake, which would terminate the replacement pump.
+pub(crate) fn discard_previous_quit() {
+    let mut message = MSG::default();
+    // SAFETY: the supervisor owns this entire thread, and the previous run has
+    // destroyed its windows, unhooked callbacks and uninitialized COM. No live
+    // source's messages are discarded. Cancellation lives in a separate atomic/channel.
+    while unsafe {
+        PeekMessageW(
+            &mut message,
+            None,
+            0,
+            0,
+            windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+        )
+    }
+    .as_bool()
+    {}
 }
 
 /// Handle to a pump running on its own thread. Dropping it stops that thread.
@@ -362,7 +396,9 @@ where
                 // and handshake. Tear down rather than pump forever.
                 return;
             }
-            pump_with_handler(name, &mut handler);
+            if let Err(error) = pump_with_handler(name, &mut handler) {
+                tracing::error!(pump = name, ?error, "pump failed");
+            }
         })
         .map_err(|e| PlatformError::new("pump_thread_spawn_failed", e.to_string()))?;
 
@@ -397,8 +433,11 @@ where
 /// A caller that needs to be stoppable from elsewhere publishes
 /// `PumpWaker::new(current_thread_id())` before entering, and the owner posts a stop
 /// through it.
-pub fn pump_with_handler<H: PumpHandler>(name: &'static str, handler: &mut H) {
-    loop {
+pub fn pump_with_handler<H: PumpHandler>(
+    name: &'static str,
+    handler: &mut H,
+) -> Result<(), PlatformError> {
+    while !handler.should_stop() {
         let mut msg = MSG::default();
         // SAFETY: `msg` is a live MSG the call fills in before we read it. A NULL window
         // filter means "any message for this thread", which is what a pump wants.
@@ -412,11 +451,14 @@ pub fn pump_with_handler<H: PumpHandler>(name: &'static str, handler: &mut H) {
                 pump = name, error = ?err,
                 "GetMessageW failed; leaving the pump loop"
             );
-            return;
+            return Err(PlatformError::new(
+                "get_message_failed",
+                format!("{name}: {err:?}"),
+            ));
         }
         if got.0 == 0 {
             // WM_QUIT — only ever posted by this thread itself via `post_quit`.
-            return;
+            return Ok(());
         }
 
         // A NULL hwnd marks a thread message. Microsoft is explicit that such messages
@@ -424,10 +466,10 @@ pub fn pump_with_handler<H: PumpHandler>(name: &'static str, handler: &mut H) {
         // handed to `DispatchMessageW`.
         if msg.hwnd.0.is_null() {
             if msg.message == WM_PUMP_STOP {
-                return;
+                return Ok(());
             }
             if handler.on_thread_message(msg.message, msg.wParam, msg.lParam) == PumpVerdict::Quit {
-                return;
+                return Ok(());
             }
             continue;
         }
@@ -439,6 +481,7 @@ pub fn pump_with_handler<H: PumpHandler>(name: &'static str, handler: &mut H) {
             DispatchMessageW(&msg);
         }
     }
+    Ok(())
 }
 
 /// Pumps messages on the **calling** thread until it is asked to quit.
