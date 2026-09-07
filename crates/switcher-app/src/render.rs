@@ -106,6 +106,49 @@ impl BadgeCache {
     pub fn clear(&mut self) {
         self.entries.clear();
     }
+
+    /// tray-icon/CreateIcon consumes straight RGBA; the overlay consumes premul BGRA.
+    /// Native regression in switcher-windows verifies the alpha convention.
+    pub fn tray_rgba(&self, content: &BadgeContent, size: u32) -> Result<Vec<u8>, RenderError> {
+        if !(8..=128).contains(&size) {
+            return Err(RenderError::InvalidMetrics);
+        }
+        if content.label.chars().take(17).count() > 16 {
+            return Err(RenderError::TooLarge);
+        }
+        let edge = size as f32;
+        let mut text_px = (edge * 0.9).round();
+        while text_px > 1.0
+            && measure_label(&self.font, &content.label, text_px).is_some_and(|ink| {
+                ink.bounds.width() > edge - 2.0 || ink.bounds.height() > edge - 2.0
+            })
+        {
+            text_px -= 1.0;
+        }
+        let metrics = BadgeMetrics {
+            height_dip: edge,
+            min_width_dip: edge,
+            pad_x_dip: 1.0,
+            radius_dip: edge / 4.0,
+            text_px_dip: text_px,
+        };
+        let image = render_badge(&self.font, metrics, content, 96)?;
+        if image.width != size || image.height != size {
+            return Err(RenderError::TooLarge);
+        }
+        let mut data = image.bgra_premul;
+        for p in data.chunks_exact_mut(4) {
+            p.swap(0, 2);
+            let alpha = u32::from(p[3]);
+            for c in &mut p[..3] {
+                *c = (u32::from(*c) * 255 + alpha / 2)
+                    .checked_div(alpha)
+                    .unwrap_or(0)
+                    .min(255) as u8;
+            }
+        }
+        Ok(data)
+    }
 }
 
 struct LabelInk {
@@ -387,5 +430,41 @@ mod tests {
         assert!(cache.image(&c, 0).is_err());
         assert!(cache.image(&c, u32::MAX).is_err());
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn tray_icon_is_square_straight_rgba_with_visible_text() {
+        let cache = cache();
+        let c = content(BadgeStyle::Color);
+        let rgba = cache.tray_rgba(&c, 16).unwrap();
+        assert_eq!(rgba.len(), 16 * 16 * 4);
+        assert_eq!(
+            &rgba[(8 * 16 + 8) * 4..(8 * 16 + 8) * 4 + 4],
+            &[c.bg.r, c.bg.g, c.bg.b, 255]
+        );
+        assert_eq!(rgba[3], 0);
+        assert!(
+            rgba.chunks_exact(4)
+                .any(|p| p[3] > 0 && p[3] < 255 && p[0] > p[3])
+        );
+        for label in ["RU", "EN", "WW"] {
+            let mut c = content(BadgeStyle::Text);
+            c.label = label.into();
+            let rgba = cache.tray_rgba(&c, 16).unwrap();
+            assert_eq!(rgba.len(), 16 * 16 * 4);
+            assert!(
+                rgba.chunks_exact(4)
+                    .any(|p| p[0] > 230 && p[1] > 230 && p[2] > 230)
+            );
+        }
+    }
+
+    #[test]
+    fn long_label_cannot_change_the_declared_tray_dimensions() {
+        let cache = cache();
+        let mut c = content(BadgeStyle::Text);
+        c.label = "W".repeat(16);
+        let result = cache.tray_rgba(&c, 8);
+        assert!(result.is_err() || result.unwrap().len() == 8 * 8 * 4);
     }
 }

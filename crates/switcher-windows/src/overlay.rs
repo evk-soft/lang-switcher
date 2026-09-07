@@ -1000,6 +1000,44 @@ mod tests {
     use crate::dpi;
 
     #[test]
+    fn native_create_icon_expects_straight_alpha_and_double_multiplies_premul() {
+        use windows::Win32::Graphics::Gdi::GdiFlush;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateIcon, DI_NORMAL, DestroyIcon, DrawIconEx,
+        };
+        let mut results = Vec::new();
+        for red in [255_u8, 128] {
+            let surface = Surface::new(16, 16).unwrap();
+            let pixels: Vec<u8> = [0, 0, red, 128].repeat(16 * 16);
+            // Exactly the transformation tray-icon 0.24.1 performs before CreateIcon:
+            // swapped RGBA and one wrapping-sub alpha byte per pixel for the mask.
+            let mask = vec![128_u8.wrapping_sub(255); 16 * 16];
+            // SAFETY: the buffers outlive the call and cover a 16x16 32bpp icon
+            // and its word-aligned monochrome AND mask respectively.
+            let icon =
+                unsafe { CreateIcon(None, 16, 16, 1, 32, mask.as_ptr(), pixels.as_ptr()) }.unwrap();
+            // SAFETY: the live DIB owns 16x16x4 writable bytes; no concurrent GDI calls.
+            unsafe {
+                std::ptr::write_bytes(surface.bits, 0, 16 * 16 * 4);
+            }
+            // SAFETY: icon and DC are live, same size; no flicker brush is supplied.
+            let drawn = unsafe { DrawIconEx(surface.dc, 0, 0, icon, 16, 16, 0, None, DI_NORMAL) };
+            // SAFETY: this icon was freshly allocated and is no longer being drawn.
+            unsafe { DestroyIcon(icon) }.unwrap();
+            drawn.unwrap();
+            // SAFETY: flush this thread's GDI writes before accessing the DIB bits.
+            assert!(unsafe { GdiFlush() }.as_bool());
+            // SAFETY: the center is within the live DIB, and GDI has completed writes.
+            let observed = unsafe { *surface.bits.add((8 * 16 + 8) * 4 + 2) };
+            println!("CreateIcon input red={red} alpha=128; DrawIconEx on black: red={observed}");
+            results.push(observed);
+        }
+        // Straight red produces half brightness at alpha=128. Premultiplied input
+        // is multiplied a second time by CreateIcon's path, causing a dark fringe.
+        assert_eq!(results, [128, 64]);
+    }
+
+    #[test]
     fn rejected_show_hides_previous_badge_and_reports_degradation() {
         let (_commands, requests) = crossbeam_channel::unbounded();
         let (events, received) = crossbeam_channel::unbounded();

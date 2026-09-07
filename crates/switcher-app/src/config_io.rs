@@ -95,13 +95,15 @@ pub(crate) mod tests {
     pub(crate) struct TempDir(pub std::path::PathBuf);
     impl TempDir {
         pub(crate) fn new() -> Self {
+            static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "lang-switcher-config-{}-{}",
+                "lang-switcher-config-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT_DIR.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir(&dir).unwrap();
             Self(dir)
