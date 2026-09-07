@@ -10,12 +10,13 @@
 //!
 //! The expectations to tick off are in `docs/smoke/m1-windows.md`, section C.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use switcher_platform::events::{BadgeImage, PlatformEvent, Point, ResolvedAnchor};
-use switcher_platform::ports::OverlayWindow;
+use switcher_platform::ports::{OverlayWindow, PointerTracker};
 use switcher_windows::dpi;
 use switcher_windows::overlay::{Overlay, geometry};
+use switcher_windows::pointer::Pointer;
 use tracing_subscriber::EnvFilter;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
@@ -56,7 +57,27 @@ fn main() {
     );
 
     let (events_tx, events_rx) = crossbeam_channel::unbounded();
-    let overlay = Overlay::new(events_tx).expect("the overlay window must open");
+    let overlay = Overlay::new(events_tx.clone()).expect("the overlay window must open");
+
+    if std::env::args().nth(1).as_deref() == Some("follow") {
+        let pointer = Pointer::new(events_tx).expect("pointer tracker must start");
+        let anchor = pointer
+            .cursor_pos()
+            .map(ResolvedAnchor::Cursor)
+            .unwrap_or(ResolvedAnchor::Fixed);
+        let mut badge = synthetic_badge(overlay.dpi_for(anchor));
+        overlay.show(&badge, anchor);
+        pointer.set_active(true);
+        tracing::info!("move the mouse across monitors; press Enter to disarm and hide");
+        wait_for_enter(&overlay, &events_rx, &mut badge, Some(anchor));
+        pointer.set_active(false);
+        overlay.hide();
+        tracing::info!(
+            "hidden: move the mouse and check for no PointerMoved after pointer_disarmed; Enter exits"
+        );
+        wait_for_enter(&overlay, &events_rx, &mut badge, None);
+        return;
+    }
 
     // Phase 1: parked. Everything that needs a *stationary* target is checked here, and this
     // phase exists because the first run by someone other than the author established that
@@ -251,12 +272,28 @@ fn wait_with_events(
     events: &crossbeam_channel::Receiver<PlatformEvent>,
     enter: &crossbeam_channel::Receiver<()>,
     badge: &mut BadgeImage,
-    anchor: Option<ResolvedAnchor>,
+    mut anchor: Option<ResolvedAnchor>,
 ) {
+    let mut counted_since = Instant::now();
+    let mut moves = 0u64;
     loop {
         crossbeam_channel::select! {
             recv(enter) -> _ => return,
             recv(events) -> event => match event {
+                Ok(PlatformEvent::PointerMoved { pos }) => {
+                    moves += 1;
+                    let elapsed = counted_since.elapsed();
+                    if elapsed >= Duration::from_secs(1) {
+                        tracing::debug!(moves, per_second = moves as f64 / elapsed.as_secs_f64(), "pointer event rate");
+                        moves = 0;
+                        counted_since = Instant::now();
+                    }
+                    if anchor.is_some() {
+                        anchor = Some(ResolvedAnchor::Cursor(pos));
+                        overlay.move_to(ResolvedAnchor::Cursor(pos));
+                    }
+                }
+                Ok(PlatformEvent::CapabilityChanged(report)) => tracing::info!(?report, "adapter status"),
                 Ok(PlatformEvent::OverlayScaleChanged { dpi }) => {
                     tracing::info!(dpi, "OverlayScaleChanged during interactive wait");
                     if let Some(anchor) = anchor {

@@ -30,7 +30,7 @@
 | 8 | порты и ядро под ADR-0005…0008, урезание зависимостей | ✅ сделано | ветка `feat/m1-task8-contracts` |
 | 9 | фундамент: манифест PMv2, win_util, supervise | ✅ сделано | ветка `feat/m1-task9-foundation` |
 | 10 | overlay.rs + geometry.rs + overlay_smoke — **риск №1 (1/2)** | ✅ сделано | ветка `feat/m1-task10-overlay`; визуальные пункты чеклиста ждут человека |
-| 11 | pointer.rs (Raw Input): бейдж следует за курсором — **риск №1 (2/2)** | ⬜ | |
+| 11 | pointer.rs (Raw Input): бейдж следует за курсором — **риск №1 (2/2)** | ✅ код и native-тесты; визуальный smoke ожидает проверки | этот коммит |
 | 12 | layout_monitor.rs: 2 источника + взводимый фолбэк — **риск №2** | ⬜ | |
 | 13 | tsf.rs — третий источник (STA/COM) | ⬜ | |
 | 14 | autostart.rs (HKCU\Run) | ⬜ | |
@@ -2218,6 +2218,8 @@ git commit -m "feat(windows): layered overlay window with pure placement geometr
 
 ### Задача 11: pointer.rs (Raw Input) — бейдж следует за курсором, риск №1 (2/2)
 
+**Реализовано 2026-09-07 в основной папке.** Четыре теста курсора включают фактическую регистрацию/снятие через Windows и регрессию `WM_QUIT`. Независимое ревью выявило поглощение `WM_QUIT` фильтрованным `PeekMessageW`; исправлено возвратом `PumpVerdict::Quit`. Шаг 5 реализован как интерактивный режим, но визуальная и нагрузочная приёмка пока не выполнена.
+
 **Файлы:**
 - Создать: `crates/switcher-windows/src/pointer.rs` — Raw Input: взвод/снятие, коалесценция, `cursor_pos()`
 - Изменить: `crates/switcher-windows/src/lib.rs` — `pub mod pointer;`
@@ -2229,7 +2231,7 @@ git commit -m "feat(windows): layered overlay window with pure placement geometr
 - Потребляет: задача 8 — `PointerTracker`, `PlatformEvent::PointerMoved`, `Point`; задача 9 — `win_util` (message-only окно + насос); задача 10 — `Overlay` (для примера).
 - Производит: `pointer::Pointer::new(tx) -> Result<Pointer, PlatformError>` (реализует `PointerTracker`).
 
-- [ ] **Шаг 1: тест на главный футган — `RIDEV_REMOVE` с NULL-целью (red)**
+- [x] **Шаг 1: тест на главный футган — `RIDEV_REMOVE` с NULL-целью (red)**
 
 Единственное место `pointer.rs`, которое можно проверить unit-тестом, и ровно то, где ошибка тихая: Learn документирует «If **RIDEV_REMOVE** is set and the **hwndTarget** member is not set to NULL, then RegisterRawInputDevices function will fail», а для `RIDEV_INPUTSINK` — «hwndTarget must be specified». Перепутать местами — снятие подписки молча провалится, и ADR-0003 будет нарушен без единого симптома. Поэтому конструирование запроса выносится в чистую функцию и тестируется:
 
@@ -2254,7 +2256,7 @@ fn disarm_request_has_a_null_target_and_arm_request_does_not() {
 Запустить: `cargo test -p switcher-windows pointer`
 Ожидание: FAIL — `raw_input_request` ещё `todo!("task 11")`.
 
-- [ ] **Шаг 2: реализовать запрос и поток курсора**
+- [x] **Шаг 2: реализовать запрос и поток курсора**
 
 `Pointer::new` поднимает выделенный поток с message-only окном и насосом; **при старте подписки нет** — взведение только по `set_active(true)`. `set_active` вызывается с потока ядра, а `RegisterRawInputDevices` обязана исполниться на потоке-владельце очереди сообщений `hwndTarget`, поэтому `set_active` делает `PostThreadMessageW(thread_id, WM_APP_ARM, wparam = arm as usize, 0)`, а регистрация — в обработчике. Хранить в структуре только `thread_id: u32` и `Sender`; HWND границу потока не пересекает.
 
@@ -2265,13 +2267,13 @@ fn disarm_request_has_a_null_target_and_arm_request_does_not() {
 Запустить: `cargo test -p switcher-windows pointer`
 Ожидание: PASS.
 
-- [ ] **Шаг 3: позиция берётся из `GetCursorPos`, а не из `RAWMOUSE`**
+- [x] **Шаг 3: позиция берётся из `GetCursorPos`, а не из `RAWMOUSE`**
 
 `WM_INPUT` (`= 255`, `WAM:6990`) используется **только как признак «что-то двинулось»**; координаты читаются `GetCursorPos(*mut POINT) -> Result<()>` (`WAM:825`). Основание, а не вкусовщина: `RAWMOUSE.usFlags` бывает `MOUSE_MOVE_RELATIVE = 0` или `MOUSE_MOVE_ABSOLUTE = 1` (`UI/Input/mod.rs:103`, `:101`), то есть сырые данные у большинства мышей — device-relative дельты, минующие ускорение указателя; порту нужны физические экранные пиксели (ADR-0005). Побочная выгода: `GetRawInputData` и разбор `RAWINPUT`-юниона не нужны вовсе — минус один источник unsafe.
 
 `cursor_pos()` (одиночное чтение для разрешения якоря) вызывается синхронно на потоке вызывающего: `GetCursorPos` не принимает HWND нашего окна — то же обоснование, что у `dpi_for`.
 
-- [ ] **Шаг 4: коалесценция без таймера**
+- [x] **Шаг 4: коалесценция без таймера**
 
 При `RIDEV_INPUTSINK` `WM_INPUT` приходит на каждый пакет мыши (125–1000 Гц). Коалесценция делается дренажом очереди, а не таймером — иначе появилось бы третье взводимое исключение к ADR-0003: получив `WM_INPUT`, вычерпать все уже стоящие в очереди `WM_INPUT` через `PeekMessageW(&mut msg, Some(hwnd), WM_INPUT, WM_INPUT, PM_REMOVE)` (`WAM:1842`, `PM_REMOVE = 1` `:5493`) и только потом один раз прочитать `GetCursorPos` и отправить одно `PointerMoved`. Всплеск сворачивается в одно событие, последняя позиция никогда не теряется, ни одного таймера не появляется.
 
@@ -2279,14 +2281,14 @@ fn disarm_request_has_a_null_target_and_arm_request_does_not() {
 
 - [ ] **Шаг 5: расширить smoke до живого курсора и доказать нулевой простой**
 
-В `overlay_smoke.rs` добавить второй режим (аргумент `follow`): подписаться на канал `PlatformEvent`, вызвать `pointer.set_active(true)`, показать бейдж и на каждое `PointerMoved` вызывать `overlay.move_to(Cursor(pos))`; раз в секунду печатать `debug!` со счётчиком событий; по нажатию Ctrl+C — `set_active(false)` и `hide()`.
+В `overlay_smoke.rs` добавить второй режим (аргумент `follow`): подписаться на канал `PlatformEvent`, вызвать `pointer.set_active(true)`, показать бейдж и на каждое `PointerMoved` вызывать `overlay.move_to(Cursor(pos))`; раз в секунду печатать `debug!` со счётчиком событий; по первому Enter — `set_active(false)` и `hide()`; второе Enter завершает процесс. Так скрытый режим остаётся доступен для проверки простоя.
 
 Обязательный шаг наблюдаемости (это и есть проверка ADR-0003, а не украшение): в режиме `follow` после `set_active(false)` при **скрытом** бейдже прогнать мышь по всему экрану с `RUST_LOG=switcher_windows=trace`.
 
 Запустить: `cargo run -p switcher-windows --example overlay_smoke -- follow`
 Ожидание: (1) бейдж едет за курсором без видимого отставания и без джиттера, включая переход между мониторами 100 %/200 % — на переходе появляется одна строка `OverlayScaleChanged`, а размер бейджа исправляется следующим показом; (2) после снятия — в логе **ноль** строк `PointerMoved` на любой прогон мыши; (3) Task Manager: 0 % CPU при снятой подписке. Ненулевое число `PointerMoved` при снятой подписке = `RIDEV_REMOVE` провалился (почти наверняка ненулевой `hwndTarget`).
 
-- [ ] **Шаг 6: гейты и коммит**
+- [x] **Шаг 6: гейты и коммит**
 
 Запустить: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check`
 Ожидание: чисто.

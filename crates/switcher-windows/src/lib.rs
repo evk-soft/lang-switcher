@@ -4,5 +4,6 @@
 
 pub mod dpi;
 pub mod overlay;
+pub mod pointer;
 pub mod supervise;
 pub mod win_util;
