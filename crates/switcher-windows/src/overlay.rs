@@ -39,8 +39,8 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, SW_HIDE,
     SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, ShowWindow,
-    ULW_ALPHA, UpdateLayeredWindow, WM_DISPLAYCHANGE, WM_DPICHANGED, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    ULW_ALPHA, UpdateLayeredWindow, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -121,6 +121,7 @@ impl Overlay {
                 events,
                 dpi_cache: DpiCache::new(),
                 visible: false,
+                degraded: false,
                 shown_dpi: DEFAULT_DPI,
                 reported_mismatch: None,
                 last_anchor: None,
@@ -390,6 +391,7 @@ struct OverlayThread {
     events: Sender<PlatformEvent>,
     dpi_cache: DpiCache,
     visible: bool,
+    degraded: bool,
     /// DPI of the image currently on screen, so `move_to` can notice a monitor crossing
     /// without being handed the image again.
     shown_dpi: u32,
@@ -439,6 +441,10 @@ impl OverlayThread {
                 width = image.width, height = image.height, len = image.bgra_premul.len(),
                 "badge image is not self-consistent; refusing to blit it"
             );
+            self.show_failed(PlatformError::new(
+                "overlay_invalid_image",
+                "badge image has invalid dimensions or pixels",
+            ));
             return;
         };
 
@@ -455,10 +461,14 @@ impl OverlayThread {
             // Otherwise a GDI failure during a resize leaves the previous badge frozen on
             // screen: it is still visible, but `move_to` now finds no surface and refuses to
             // move it. A badge stuck at a stale position is worse than no badge.
-            self.hide();
+            self.show_failed(e);
             return;
         }
         let Some(surface) = self.surface.as_ref() else {
+            self.show_failed(PlatformError::new(
+                "overlay_missing_surface",
+                "badge surface is unavailable",
+            ));
             return;
         };
         if surface.width != size.width || surface.height != size.height {
@@ -471,6 +481,10 @@ impl OverlayThread {
                 image_w = size.width, image_h = size.height,
                 "surface does not match the image; refusing to blit it"
             );
+            self.show_failed(PlatformError::new(
+                "overlay_surface_mismatch",
+                "badge surface does not match the image",
+            ));
             return;
         }
 
@@ -524,6 +538,7 @@ impl OverlayThread {
                 error = %e, ?position, width = size.width, height = size.height,
                 "UpdateLayeredWindow failed; the badge was not shown"
             );
+            self.show_failed(PlatformError::new("overlay_blit_failed", e.message()));
             return;
         }
 
@@ -538,9 +553,23 @@ impl OverlayThread {
         self.shown_dpi = image.dpi;
         self.last_anchor = Some(anchor);
         self.report_scale_mismatch(image.dpi, facts.dpi);
+        if self.degraded {
+            self.degraded = false;
+            let _ = self
+                .events
+                .send(PlatformEvent::CapabilityChanged(CapabilityReport {
+                    capability: Capability::Overlay,
+                    state: CapabilityState::Ok,
+                    code: "overlay_recovered",
+                    detail: "badge rendering resumed".to_owned(),
+                }));
+        }
     }
 
     fn move_to(&mut self, anchor: ResolvedAnchor) {
+        if !self.visible {
+            return;
+        }
         let Some(size) = self
             .surface
             .as_ref()
@@ -615,6 +644,23 @@ impl OverlayThread {
         );
         // Consumes the flag, drops the cache, re-places, and reports any scale mismatch.
         self.move_to(anchor);
+    }
+
+    /// Never leave the previous language on screen after a rejected update. Clear the
+    /// surface too: a failed resize may have replaced its size without updating the HWND.
+    fn show_failed(&mut self, error: PlatformError) {
+        self.hide();
+        self.degraded = true;
+        self.surface = None;
+        self.last_anchor = None;
+        let _ = self
+            .events
+            .send(PlatformEvent::CapabilityChanged(CapabilityReport {
+                capability: Capability::Overlay,
+                state: CapabilityState::Degraded,
+                code: error.code,
+                detail: error.detail,
+            }));
     }
 
     fn hide(&mut self) {
@@ -729,7 +775,7 @@ unsafe extern "system" fn overlay_wndproc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         },
         || {
-            if msg == WM_DPICHANGED || msg == WM_DISPLAYCHANGE {
+            if matches!(msg, WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE) {
                 MONITOR_FACTS_STALE.set(true);
                 tracing::debug!(
                     target: "switcher_windows::overlay",
@@ -747,7 +793,7 @@ unsafe extern "system" fn overlay_wndproc(
                     );
                 }
             }
-            // SAFETY: as above — the default handler gets every message, including the two
+            // SAFETY: as above — the default handler gets every message, including those
             // we only took note of.
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         },
@@ -952,6 +998,76 @@ mod tests {
 
     use super::*;
     use crate::dpi;
+
+    #[test]
+    fn rejected_show_hides_previous_badge_and_reports_degradation() {
+        let (_commands, requests) = crossbeam_channel::unbounded();
+        let (events, received) = crossbeam_channel::unbounded();
+        let mut overlay = OverlayThread {
+            surface: None,
+            window: OverlayHwnd::new().expect("create test window"),
+            requests,
+            events,
+            dpi_cache: DpiCache::new(),
+            visible: false,
+            degraded: false,
+            shown_dpi: DEFAULT_DPI,
+            reported_mismatch: None,
+            last_anchor: None,
+        };
+        let mut image = BadgeImage {
+            width: 1,
+            height: 1,
+            bgra_premul: vec![0, 0, 0, 0],
+            dpi: DEFAULT_DPI,
+        };
+        overlay.show(&image, ResolvedAnchor::Fixed);
+        assert!(overlay.visible, "valid image must first be shown");
+        image.bgra_premul.clear();
+        overlay.show(&image, ResolvedAnchor::Fixed);
+        assert!(
+            !overlay.visible,
+            "a rejected new image must not leave a stale badge"
+        );
+        assert!(overlay.surface.is_none());
+        assert!(overlay.last_anchor.is_none());
+        assert!(received.try_iter().any(|event| matches!(
+            event,
+            PlatformEvent::CapabilityChanged(CapabilityReport {
+                capability: Capability::Overlay,
+                state: CapabilityState::Degraded,
+                ..
+            })
+        )));
+        image.bgra_premul = vec![0, 0, 0, 0];
+        overlay.show(&image, ResolvedAnchor::Fixed);
+        assert!(overlay.visible);
+        assert!(received.try_iter().any(|event| matches!(
+            event,
+            PlatformEvent::CapabilityChanged(CapabilityReport {
+                capability: Capability::Overlay,
+                state: CapabilityState::Ok,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn work_area_notification_invalidates_cached_monitor_facts() {
+        let window = OverlayHwnd::new().expect("create test window");
+        MONITOR_FACTS_STALE.set(false);
+        // SAFETY: call our own procedure with a live window owned by this test thread;
+        // WM_SETTINGCHANGE accepts a null lParam. No pointer to external state is passed.
+        unsafe {
+            overlay_wndproc(
+                window.0,
+                windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        assert!(MONITOR_FACTS_STALE.replace(false));
+    }
 
     fn image(width: u32, height: u32, len: usize) -> BadgeImage {
         BadgeImage {

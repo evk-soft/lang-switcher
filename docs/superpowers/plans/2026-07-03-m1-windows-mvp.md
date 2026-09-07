@@ -12,6 +12,12 @@
 
 Единственный источник истины о состоянии M1. Обновляется в том же коммите, что и задача.
 
+**Аудит 2026-09-07:** проверена рабочая копия `feat/m1-task10-overlay`, база `d855bea`.
+Задачи 1–10 реализованы, 11–21 остаются впереди. Исправления описаны в
+[отчёте](../../research/2026-09-07-implementation-audit.md). Примеры кода завершённых задач
+1–10 — исторические шаги TDD; их нельзя копировать поверх текущих файлов. Актуальный
+контракт раскладки — [ADR-0011](../../architecture/adr/0011-authoritative-layout-snapshots.md).
+
 | # | Задача | Статус | Коммит |
 |---|---|---|---|
 | 1 | каркас workspace | ✅ сделано | `2d9313e` |
@@ -1109,7 +1115,7 @@ git commit -m "feat(core): TOML config model with defaults, clamping and schema 
 **Интерфейсы:**
 - Потребляет: `content::{cue_for, BadgeContent}` (Задача 3), `config::{BadgeMode, AnchorPref, Config}` (Задача 4), типы Задачи 2.
 - Производит (контракты стабильны для задач 6, 7, 19):
-  - `engine::STALE_ECHO_WINDOW_MS: u64 = 150`,
+  - повтор текущего `LayoutId` подавляется; временного окна дедупликации нет (ADR-0011),
   - `engine::Event { Layout { layout: LayoutId, lang: LangTag, source: LayoutSource }, AnchorResolved { caret: Option<Point>, cursor: Option<Point> }, Pointer { pos: Point }, HideTimerFired, SetMode(BadgeMode), SetSoundEnabled(bool), SetAutostart(bool) }`,
   - `engine::ResolvedAnchor { Caret(Point), Cursor(Point), Fixed }`,
   - `engine::Effect { QueryAnchor, ShowBadge { content: BadgeContent, anchor: ResolvedAnchor }, MoveBadge { pos: Point }, HideBadge, ArmHideTimer { after_ms: u64 }, CancelHideTimer, SetPointerTracking(bool), PlaySound { cue: SoundCue, volume: f32 }, UpdateTray { label: String, lang: LangTag }, ApplyAutostart(bool), PersistConfig }`,
@@ -1117,132 +1123,14 @@ git commit -m "feat(core): TOML config model with defaults, clamping and schema 
 
 Семантика приёма события раскладки (правила ядра из спеки):
 1. Тот же `LayoutId`, что текущий, — игнор (это же схлопывает дубли от трёх источников).
-2. `LayoutId` равен предыдущему И `now_ms - last_change_ms < STALE_ECHO_WINDOW_MS` — «запоздавшее эхо» отставшего источника, игнор. (Осознанный компромисс: реальный двойной переклик туда-обратно быстрее 150 мс тоже съедается.)
-3. Иначе — принять: обновить трей; для `source == Initial` на этом всё (ни бейджа, ни звука при старте); иначе — звук (если включён) и `QueryAnchor` (бейдж покажется в Задаче 6 по `AnchorResolved`).
+2. Возврат к предыдущему `LayoutId` принимается при любом интервале. Рантайм подтверждает снимок через `LayoutMonitor::current()`; старый payload уведомления не является источником истины (ADR-0011).
+3. Принятое событие обновляет трей. `Initial` не играет звук и не показывает транзиентный бейдж, но восстанавливает Follow через `QueryAnchor`. Обычная смена даёт звук (если включён) и `QueryAnchor`.
 
 - [ ] **Шаг 1: написать падающие тесты**
 
 Тестовый модуль `engine.rs` (выше — код Шага 3, но с `todo!("task 5")` в теле `on_layout`; остальные ветки `handle` — `todo!("task 6")`/`todo!("task 7")` как в листинге):
 
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeMap;
-    use switcher_platform::events::{LangTag, LayoutId, LayoutSource, Point};
-    use switcher_platform::ports::SoundCue;
-
-    use crate::config::Config;
-    use crate::content::{BadgeContent, BadgeStyle};
-
-    pub(super) const RU_ID: LayoutId = LayoutId(0x0419_0419);
-    pub(super) const EN_ID: LayoutId = LayoutId(0x0409_0409);
-
-    pub(super) fn ru() -> LangTag {
-        LangTag::new("ru-RU")
-    }
-
-    pub(super) fn en() -> LangTag {
-        LangTag::new("en-US")
-    }
-
-    pub(super) fn layout(id: LayoutId, lang: LangTag, source: LayoutSource) -> Event {
-        Event::Layout {
-            layout: id,
-            lang,
-            source,
-        }
-    }
-
-    pub(super) fn default_content(lang: &LangTag) -> BadgeContent {
-        BadgeContent::for_lang(lang, BadgeStyle::Text, &BTreeMap::new())
-    }
-
-    /// Engine already past startup: Initial EN at t=0.
-    pub(super) fn engine_after_initial() -> Engine {
-        let mut e = Engine::new(Config::default());
-        e.handle(layout(EN_ID, en(), LayoutSource::Initial), 0);
-        e
-    }
-
-    #[test]
-    fn initial_layout_updates_tray_only() {
-        let mut e = Engine::new(Config::default());
-        let fx = e.handle(layout(EN_ID, en(), LayoutSource::Initial), 0);
-        assert_eq!(
-            fx,
-            vec![Effect::UpdateTray {
-                label: "EN".to_owned(),
-                lang: en(),
-            }]
-        );
-    }
-
-    #[test]
-    fn layout_change_updates_tray_plays_sound_and_queries_anchor() {
-        let mut e = engine_after_initial();
-        let fx = e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
-        assert_eq!(
-            fx,
-            vec![
-                Effect::UpdateTray {
-                    label: "RU".to_owned(),
-                    lang: ru(),
-                },
-                Effect::PlaySound {
-                    cue: SoundCue::Ru,
-                    volume: 0.4,
-                },
-                Effect::QueryAnchor,
-            ]
-        );
-    }
-
-    #[test]
-    fn first_event_from_any_source_is_accepted() {
-        let mut e = Engine::new(Config::default());
-        let fx = e.handle(layout(RU_ID, ru(), LayoutSource::Tsf), 5);
-        assert!(fx.contains(&Effect::QueryAnchor));
-    }
-
-    #[test]
-    fn same_layout_from_another_source_is_deduplicated() {
-        let mut e = engine_after_initial();
-        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
-        let fx = e.handle(layout(RU_ID, ru(), LayoutSource::Tsf), 1020);
-        assert_eq!(fx, vec![]);
-        let fx = e.handle(layout(RU_ID, ru(), LayoutSource::ForegroundChange), 9000);
-        assert_eq!(fx, vec![]);
-    }
-
-    #[test]
-    fn stale_echo_of_previous_layout_within_window_is_ignored() {
-        let mut e = engine_after_initial();
-        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
-        let fx = e.handle(layout(EN_ID, en(), LayoutSource::ForegroundChange), 1100);
-        assert_eq!(fx, vec![]);
-    }
-
-    #[test]
-    fn toggle_back_after_stale_window_is_accepted() {
-        let mut e = engine_after_initial();
-        e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
-        let fx = e.handle(layout(EN_ID, en(), LayoutSource::ShellHook), 1150);
-        assert!(fx.contains(&Effect::QueryAnchor));
-    }
-
-    #[test]
-    fn sound_disabled_suppresses_play_sound() {
-        let mut cfg = Config::default();
-        cfg.sound.enabled = false;
-        let mut e = Engine::new(cfg);
-        e.handle(layout(EN_ID, en(), LayoutSource::Initial), 0);
-        let fx = e.handle(layout(RU_ID, ru(), LayoutSource::ShellHook), 1000);
-        assert!(!fx.iter().any(|f| matches!(f, Effect::PlaySound { .. })));
-        assert!(fx.contains(&Effect::QueryAnchor));
-    }
-}
-```
+Актуальные реализация и регрессионные тесты: [engine.rs](../../../crates/switcher-core/src/engine.rs). Старый листинг с временным подавлением удалён аудитом 2026-09-07; контракт — ADR-0011.
 
 В `lib.rs` добавить `pub mod engine;`.
 
@@ -1255,168 +1143,7 @@ mod tests {
 
 Содержимое `engine.rs` над тестами:
 
-```rust
-//! The core state machine: pure `(state, event, now) -> effects`. No OS calls, no
-//! clocks, no channels — the runtime supplies `now_ms` and executes the effects.
-
-use switcher_platform::events::{LangTag, LayoutId, LayoutSource, Point};
-use switcher_platform::ports::SoundCue;
-
-use crate::config::{AnchorPref, BadgeMode, Config};
-use crate::content::{cue_for, BadgeContent};
-
-/// A source reporting the layout we just switched AWAY from within this window
-/// is treated as a stale echo of the same physical switch, not a new switch.
-pub const STALE_ECHO_WINDOW_MS: u64 = 150;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Event {
-    Layout {
-        layout: LayoutId,
-        lang: LangTag,
-        source: LayoutSource,
-    },
-    /// Runtime's synchronous answer to `Effect::QueryAnchor`.
-    AnchorResolved {
-        caret: Option<Point>,
-        cursor: Option<Point>,
-    },
-    Pointer {
-        pos: Point,
-    },
-    HideTimerFired,
-    SetMode(BadgeMode),
-    SetSoundEnabled(bool),
-    SetAutostart(bool),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolvedAnchor {
-    Caret(Point),
-    Cursor(Point),
-    Fixed,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Effect {
-    /// Ask the runtime to query caret/cursor availability and feed back AnchorResolved.
-    QueryAnchor,
-    ShowBadge {
-        content: BadgeContent,
-        anchor: ResolvedAnchor,
-    },
-    /// New anchor position for the visible badge (runtime applies the offset).
-    MoveBadge {
-        pos: Point,
-    },
-    HideBadge,
-    ArmHideTimer {
-        after_ms: u64,
-    },
-    CancelHideTimer,
-    SetPointerTracking(bool),
-    PlaySound {
-        cue: SoundCue,
-        volume: f32,
-    },
-    UpdateTray {
-        label: String,
-        lang: LangTag,
-    },
-    ApplyAutostart(bool),
-    /// Config changed: runtime saves it and re-syncs tray checkmarks.
-    PersistConfig,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BadgeState {
-    Hidden,
-    /// QueryAnchor issued, waiting for AnchorResolved.
-    AwaitingAnchor,
-    Visible {
-        tracking: bool,
-    },
-}
-
-#[derive(Debug)]
-pub struct Engine {
-    cfg: Config,
-    layout: Option<(LayoutId, LangTag)>,
-    prev_layout: Option<LayoutId>,
-    last_change_ms: u64,
-    badge: BadgeState,
-}
-
-impl Engine {
-    pub fn new(cfg: Config) -> Self {
-        Self {
-            cfg,
-            layout: None,
-            prev_layout: None,
-            last_change_ms: 0,
-            badge: BadgeState::Hidden,
-        }
-    }
-
-    pub fn config(&self) -> &Config {
-        &self.cfg
-    }
-
-    pub fn handle(&mut self, event: Event, now_ms: u64) -> Vec<Effect> {
-        match event {
-            Event::Layout {
-                layout,
-                lang,
-                source,
-            } => self.on_layout(layout, lang, source, now_ms),
-            Event::AnchorResolved { .. } => todo!("task 6"),
-            Event::Pointer { .. }
-            | Event::HideTimerFired
-            | Event::SetMode(_)
-            | Event::SetSoundEnabled(_)
-            | Event::SetAutostart(_) => todo!("task 7"),
-        }
-    }
-
-    fn on_layout(
-        &mut self,
-        layout: LayoutId,
-        lang: LangTag,
-        source: LayoutSource,
-        now_ms: u64,
-    ) -> Vec<Effect> {
-        if self.layout.as_ref().map(|(id, _)| *id) == Some(layout) {
-            return vec![];
-        }
-        let stale_echo = self.prev_layout == Some(layout)
-            && now_ms.saturating_sub(self.last_change_ms) < STALE_ECHO_WINDOW_MS;
-        if stale_echo {
-            return vec![];
-        }
-        self.prev_layout = self.layout.take().map(|(id, _)| id);
-        self.layout = Some((layout, lang.clone()));
-        self.last_change_ms = now_ms;
-
-        let content = BadgeContent::for_lang(&lang, self.cfg.badge.style, &self.cfg.badge.colors);
-        let mut fx = vec![Effect::UpdateTray {
-            label: content.label,
-            lang: lang.clone(),
-        }];
-        if source == LayoutSource::Initial {
-            return fx;
-        }
-        if self.cfg.sound.enabled {
-            fx.push(Effect::PlaySound {
-                cue: cue_for(&lang),
-                volume: self.cfg.sound.volume,
-            });
-        }
-        self.badge = BadgeState::AwaitingAnchor;
-        fx.push(Effect::QueryAnchor);
-        fx
-    }
-}
-```
+Актуальные реализация и регрессионные тесты: [engine.rs](../../../crates/switcher-core/src/engine.rs). Старый листинг с временным подавлением удалён аудитом 2026-09-07; контракт — ADR-0011.
 
 - [ ] **Шаг 4: убедиться, что тесты проходят**
 
@@ -2727,9 +2454,9 @@ ADR-0009 в карте потоков называет `ITfActiveLanguageProfile
 
 - [ ] **Шаг 3: STA-поток и правило «MTA в процессе нет»**
 
-Поток TSF поднимается отдельно и инициализирует COM как STA: `CoInitializeEx(None, COINIT_APARTMENTTHREADED) -> HRESULT` (`System/Com/mod.rs:334`) — возвращает **`HRESULT`, а не `Result`**, поэтому разбор обязателен: `S_OK` и `S_FALSE` (`= 0x1`) считать успехом, `RPC_E_CHANGED_MODE` (`= 0x80010106`) — тоже (поток уже в другом апартменте), прочее — `Err(PlatformError::new("com_init_failed", …))`. `COINIT_APARTMENTTHREADED = COINIT(2)` (`:1802`). `CoUninitialize` (`:572`) — в `Drop` гарда, парно и на том же потоке.
+Поток TSF поднимается отдельно и инициализирует COM как STA: `CoInitializeEx(None, COINIT_APARTMENTTHREADED) -> HRESULT`. `S_OK` и `S_FALSE` — успех; каждый такой вызов требует одного `CoUninitialize` на том же потоке после освобождения интерфейсов. **`RPC_E_CHANGED_MODE` — ошибка:** требуемый STA не установлен. Вернуть `PlatformError::new("com_init_failed", …)`, не создавать синк и не вызывать `CoUninitialize` за неудачную попытку. Исправлено по [контракту Microsoft](https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-coinitializeex). Проверить ветви `S_OK`, `S_FALSE`, `RPC_E_CHANGED_MODE` и прочей ошибки на границе RAII-гарда.
 
-Почему именно STA и почему это не косметика: `cpal` (через `rodio`) в `thread_local!` вызывает `CoInitializeEx(None, COINIT_APARTMENTTHREADED)` на потоке, с которого поднят звук (`cpal-0.17.3/src/host/wasapi/com.rs`), то есть в процессе уже есть STA-поток; MTA-потоков не заводить нигде (ADR-0009). `COINIT_MULTITHREADED` в этом крейте не должен появиться ни разу — проверяется grep'ом в ревью.
+TSF получает собственный STA-поток по ADR-0009. Поведение `cpal`, допускающего `RPC_E_CHANGED_MODE`, нельзя переносить в этот гард. Апартмент определяется для каждого потока: наличие STA у звука само по себе не запрещает MTA на другом потоке; правило M1 «не заводить MTA» — ограничение проекта, не требование COM ко всему процессу.
 
 Насос `GetMessageW` на этом потоке держать по умолчанию (правило проекта; необходимость подтверждается шагом 1).
 
@@ -3292,6 +3019,11 @@ git commit -m "feat(app): tray icon, menu and capability presentation on the mai
 - Потребляет: `switcher_core::engine::{Engine, Event, Effect, ResolvedAnchor}` (задачи 5–8), `switcher_platform::ports::*`, `render::BadgeCache` (задача 15), `capability::CapabilityMap` + `menu::MenuCommand` + `tray::TrayCommand` (задача 18), `switcher_windows::win_util::PumpWaker` (задача 9).
 - Производит: `Runtime::new`, `Runtime::handle_platform`, `Runtime::handle_menu`, `Runtime::reconcile_autostart`, `Runtime::fire_hide_timer`, `Runtime::timeout`, `runtime::run` — для задачи 20.
 
+`Ports` обязательно содержит `layout_monitor: Box<dyn LayoutMonitor>` (задача 12).
+Его синхронное чтение доступно и при отказе установки отдельного хука, иначе потеря
+одного источника отключит обработку всех остальных (ADR-0011). В тестах нужен
+`MockLayoutMonitor` с управляемой последовательностью снимков/ошибок.
+
 **Форма, обеспечивающая тестируемость:** дедлайн скрытия хранится как `hide_deadline_ms: Option<u64>` на той же монотонной базе, что `now_ms` ядра, а не как `Instant`. Тогда весь автомат рантайма проверяется моками портов с инъекцией времени, а `run()` остаётся тонкой обёрткой из десяти строк.
 
 - [ ] **Шаг 1: написать падающие тесты на моках портов**
@@ -3299,6 +3031,12 @@ git commit -m "feat(app): tray icon, menu and capability presentation on the mai
 Моки: `MockOverlay { calls: Vec<OverlayCall>, dpi: u32 }` (`OverlayCall::{Show{w,h,dpi,anchor}, MoveTo(ResolvedAnchor), Hide}`), `MockPointer { cursor: Option<Point>, active: Vec<bool> }`, `MockCaret`, `MockSound { played: Vec<(SoundCue, f32)> }`, `MockAutostart { result: Result<(), PlatformError>, enabled: Result<bool, PlatformError> }`; общий вектор — `Arc<Mutex<…>>`, потому что порты `Send` и берут `&self`. `TrayCommand` собирается из тестового `Receiver`.
 
 - `layout_change_shows_badge_in_one_pass`: подать `PlatformEvent::LayoutChanged{..}` → после **одного** вызова `handle_platform` в моке оверлея уже есть `Show`. Это тест на главный инвариант: `Effect::QueryAnchor` обязан быть отвечен синхронно в том же проходе.
+- `late_notification_uses_current_snapshot`: payload говорит RU, `LayoutMonitor::current()` уже EN → ядро и трей остаются EN, лишнего звука и показа нет.
+- `layout_read_failure_never_uses_queued_payload`: ошибка `current()` → прежнее состояние сохранено, ошибка видна в диагностике; старый payload не передан ядру.
+- `rapid_return_is_not_lost`: подтверждённые EN → RU → EN за 100 мс → итоговые трей и бейдж EN.
+- `hide_deadline_wins_over_busy_pointer_stream`: канал курсора всегда готов, время пересекло дедлайн → `Hide` и отключение трекинга всё равно происходят.
+- `bootstrap_precedes_queued_hook_events`: уведомление попало в канал во время setup; рантайм сначала выполняет начальное чтение и эффекты `Initial`, затем обрабатывает очередь. Follow показан без звука.
+- `autostart_failure_rechecks_external_drift`: после отказа записи перечитать `is_enabled()` и примирить конфиг с фактом ОС; если чтение тоже отказало, сообщить неизвестное состояние и отключить галку автозапуска.
 - `query_anchor_never_leaves_the_engine_awaiting`: то же событие при `cursor = None, caret = None` → `Show` с `ResolvedAnchor::Fixed`, `pending_anchor == false` по выходе.
 - `show_uses_dpi_from_the_port_and_caches`: `MockOverlay { dpi: 144 }` → `Show{dpi: 144}`, `cache.len() == 1`; второе такое же переключение → `cache.len()` не вырос.
 - `overlay_scale_changed_equal_to_last_render_dpi_is_ignored`: после показа при 144 подать `OverlayScaleChanged{dpi:144}` → новых `Show` нет (гасит гонку двух событий, ADR-0005).
@@ -3313,6 +3051,9 @@ git commit -m "feat(app): tray icon, menu and capability presentation on the mai
 - `sound_capability_off_does_not_touch_the_config`: подать `CapabilityChanged(Sound, Off)`, затем смену раскладки → `PlaySound` всё равно передан плееру, `engine.config().sound.enabled == true` (ADR-0007).
 - `capability_changed_updates_tooltip_and_status`: пришли `SetTooltip` и `SetStatus`, тултип ≤126 UTF-16 единиц.
 - `menu_quit_sends_shutdown`: `MenuCommand::Quit` → `TrayCommand::Shutdown` и `run` завершается.
+- `shutdown_does_not_wait_for_adapter_senders`: отдельный сигнал остановки завершает
+  рантайм, даже пока адаптеры держат клоны `Sender`; закрытие всех источников не является
+  предусловием выхода.
 
 Путь записи конфига в тестах — уникальный файл в `std::env::temp_dir()`, удаляется в конце теста.
 
@@ -3369,11 +3110,11 @@ fn dispatch(&mut self, effects: Vec<Effect>, now_ms: u64) {
 - `PersistConfig` → записать `engine.config().to_toml_string()` в `cfg_path` (ошибка записи → `error!`, работа продолжается: `Capability` для конфига в контракте нет, и это осознанно), затем `cache.clear()` и `SyncChecks` из `engine.config()`.
 - `SyncTrayMenu` → только `SyncChecks`, без записи файла (асимметрия ADR-0007 сохранена намеренно).
 
-Маппинг `PlatformEvent -> Option<engine::Event>`: `LayoutChanged` → `Some(Event::Layout{..})`; `PointerMoved` → `Some(Event::Pointer{..})`; `OverlayScaleChanged { dpi }` → **`None`** плюс локальная обработка (если `last.dpi == dpi` — `trace!` и выход; иначе перерастеризовать `last.content` под новый dpi и вызвать `show` с `last.anchor`); `CapabilityChanged(report)` → **`None`** плюс `warn!(target: "switcher::capability", cap = report.capability.key(), state = ?report.state, code = report.code, "{}", report.detail)`, обновление `CapabilityMap`, `SetTooltip` + `SetStatus`.
+Маппинг `PlatformEvent -> Option<engine::Event>`: `LayoutChanged` → синхронное `ports.layout_monitor.current()` → `Event::Layout` с новой парой `layout/lang` и исходным `source` (ADR-0011). Ошибка чтения → диагностика и **`None`**, без подстановки payload. `PointerMoved` → `Some(Event::Pointer{..})`; `OverlayScaleChanged { dpi }` → **`None`** плюс локальная обработка (если бейдж скрыт или `last.dpi == dpi` — выход; иначе перерастеризовать и вызвать `show`); `CapabilityChanged(report)` → **`None`**, диагностика, обновление `CapabilityMap`, `SetTooltip` + `SetStatus`.
 
 `MenuCommand` → `Event`: `ToggleFollow` → `SetMode(если сейчас Follow, то Transient, иначе Follow)`; `ToggleSound` → `SetSoundEnabled(!cfg.sound.enabled)`; `ToggleAutostart` → `SetAutostart(!cfg.autostart)` (дедупа нет намеренно: источник истины автозапуска — реестр, он мог разъехаться); `Quit` → `TrayCommand::Shutdown` и выход из цикла.
 
-`run(rx_platform, rx_menu, …)`: два источника, поэтому блокирующий приём с дедлайном выражается `crossbeam_channel::select!` с аркой `default(dur)` (документировано в `crossbeam-channel-0.5.15/src/lib.rs:283`) — это ровно `recv_timeout` из ADR-0009, а не опрос; альтернатива «поток-мост, сводящий два канала в один» отклонена как лишний поток в карте потоков ADR-0009. При `hide_deadline_ms == None` — `select!` без `default`, то есть блокировка до события.
+`run(rx_platform, rx_menu, …)`: **перед каждым** приёмом проверить абсолютный дедлайн по текущему времени; если он истёк — выполнить `HideTimerFired` и эффекты. Затем вычислить оставшееся время и вызвать `crossbeam_channel::select!` с `default(remaining)`. Одного `default` недостаточно: постоянно готовый канал Raw Input может не дать ему выполниться. Без дедлайна — `select!` без `default`, блокировка до события; периодический опрос не добавляется.
 
 - [ ] **Шаг 4: убедиться, что тесты проходят**
 
@@ -3414,10 +3155,10 @@ git commit -m "feat(app): core loop and effect dispatcher over platform ports"
 6. **Звук.** `SoundDevice::open()` **на главном потоке** (cpal инициализирует COM как STA на вызывающем потоке; главный поток — тот, что качает сообщения). `Ok` → `SoundDevice` остаётся в `main` живым до конца, плеер уходит в ядро. `Err` → `NullSoundPlayer` + `tx_ev.send(CapabilityChanged(CapabilityReport { capability: Sound, state: Off, code: "no_output_device", detail }))`. Конфиг при этом не трогаем.
 7. **Сверка автозапуска с реестром.** `autostart.is_enabled()` — результат передаётся в `Runtime::reconcile_autostart`: при расхождении **реестр побеждает**, при `Err` — `Capability::Autostart` уходит в `Off`, пункт меню становится неактивным.
 8. **Адаптеры и их потоки** — каждый со своим `tx_ev.clone()`: оверлей, курсор, монитор раскладки (он же владеет взводимым фолбэк-опросом), TSF на своём STA-потоке. Конструктор вернул `Err` → `CapabilityChanged(<cap>, Off, …)` и Null-заглушка вместо порта; ни один отказ не роняет приложение.
-9. **Начальная раскладка.** `layout_monitor.current()` → `tx_ev.send(LayoutChanged { source: LayoutSource::Initial })`. Ядро на `Initial` обновляет **только трей** — ни бейджа, ни звука на старте (это уже гарантировано тестом `initial_layout_updates_tray_only`).
+9. **Начальная раскладка.** Рантайм синхронно выполняет `layout_monitor.current()` → `Engine::handle(Event::Layout { source: Initial, … })` и эффекты **до чтения очереди уведомлений хуков**. `Initial` обновляет трей и восстанавливает Follow без звука; транзиентный бейдж при старте скрыт. При ошибке сохранить диагностику; первое успешное чтение по следующему уведомлению выполняет эту же инициализацию. Нельзя ставить `Initial` в хвост уже работающих источников.
 10. **Поток ядра.** `thread::spawn` с `runtime::run(...)`: туда уходят `Engine`, `BadgeCache`, `CapabilityMap`, порты, `Sender<TrayCommand>`, `PumpWaker` (id главного потока), путь конфига.
 11. **Трей и насос — на главном потоке**, последним: `tray::run_tray(init, rx_tray)`. Возврат из него = `GetMessageW` вернул 0.
-12. **Graceful shutdown:** послать ядру сигнал остановки (дроп `Sender`ов достаточно: `select!` получит `Disconnected` и выйдет), `join` потока ядра с таймаутом не блокировать выход дольше секунды, затем естественный дроп RAII-обёрток хуков и `_guard` (флаш лога). `std::process::exit` запрещён.
+12. **Graceful shutdown:** отдельный канал остановки входит в `select!` рантайма; главный поток отправляет сигнал до ожидания завершения. Нельзя полагаться на удаление main-копии `Sender`: клоны остаются у адаптеров. Рантайм прекращает приём событий, останавливает принадлежащие ему адаптеры и подтверждает завершение; `join` выполняется после подтверждения. У `JoinHandle::join` нет встроенного таймаута: предел ожидания задаётся каналом подтверждения, а остановка адаптеров должна быть прерываемой, включая backoff. Проверить выход при живых источниках и при их перезапуске. После завершения потоков `_guard` флашит лог; `std::process::exit` запрещён.
 
 Плюс: `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` — release-сборка не должна открывать консоль, debug-сборка её сохраняет для разработки. Проверяется наблюдаемо на шаге 3.
 

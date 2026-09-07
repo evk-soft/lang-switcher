@@ -91,19 +91,7 @@ fn main() {
         "  7. change the display scale in Settings — the badge must re-place itself and then change size"
     );
     tracing::info!("press Enter when you are done, to start the walk across the desktop");
-    wait_for_enter();
-
-    // A scale change during the parked phase leaves a pending re-render request.
-    if let Some(dpi) = drain(&events_rx) {
-        badge = synthetic_badge(dpi);
-        tracing::info!(
-            dpi,
-            width = badge.width,
-            height = badge.height,
-            "re-rendered"
-        );
-        overlay.show(&badge, anchor);
-    }
+    wait_for_enter(&overlay, &events_rx, &mut badge, Some(anchor));
 
     // Phase 2: the walk, which is about monitor crossing and nothing else.
     let path = diagonal_across_the_virtual_desktop();
@@ -152,7 +140,7 @@ fn main() {
     tracing::info!(
         "drag THIS TERMINAL onto a monitor that is not the primary one, then press Enter"
     );
-    wait_for_enter();
+    wait_for_enter(&overlay, &events_rx, &mut badge, Some(anchor));
 
     let chosen_dpi = overlay.dpi_for(ResolvedAnchor::Fixed);
     anchor = ResolvedAnchor::Fixed;
@@ -164,24 +152,14 @@ fn main() {
          it is the scale of the monitor the adapter picked"
     );
     tracing::info!("press Enter to hide the badge");
-    wait_for_enter();
-
-    if let Some(dpi) = drain(&events_rx) {
-        badge = synthetic_badge(dpi);
-        overlay.show(&badge, anchor);
-        tracing::info!(
-            dpi,
-            "re-rendered for the Fixed anchor's monitor; press Enter"
-        );
-        wait_for_enter();
-    }
+    wait_for_enter(&overlay, &events_rx, &mut badge, Some(anchor));
 
     overlay.hide();
     tracing::info!(
         "badge hidden; the process is now idle — check Task Manager for 0% CPU, then press \
          Enter to exit"
     );
-    wait_for_enter();
+    wait_for_enter(&overlay, &events_rx, &mut badge, None);
 
     drain(&events_rx);
     tracing::info!("done");
@@ -249,15 +227,54 @@ fn synthetic_badge(dpi: u32) -> BadgeImage {
     }
 }
 
-/// Blocks until the reader presses Enter, or returns at once on a redirected or empty stdin
-/// so scripted runs do not hang.
-///
-/// A blocking read rather than a sleep, and not only for the reader's sake: the process waits
-/// on the OS with no timer and no wakeups of any kind, which is exactly the state the "0% CPU"
-/// checks are about.
-fn wait_for_enter() {
-    let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
+/// Waits for Enter while servicing overlay events, with no polling or timer. The stdin
+/// reader owns a temporary thread so a parked badge can be redrawn as soon as DPI changes.
+/// `None` means hidden: a late DPI event must never bring the badge back during the idle check.
+fn wait_for_enter(
+    overlay: &impl OverlayWindow,
+    events: &crossbeam_channel::Receiver<PlatformEvent>,
+    badge: &mut BadgeImage,
+    anchor: Option<ResolvedAnchor>,
+) {
+    let (enter_tx, enter_rx) = crossbeam_channel::bounded(1);
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        let _ = enter_tx.send(());
+    });
+    wait_with_events(overlay, events, &enter_rx, badge, anchor);
+    let _ = reader.join();
+}
+
+fn wait_with_events(
+    overlay: &impl OverlayWindow,
+    events: &crossbeam_channel::Receiver<PlatformEvent>,
+    enter: &crossbeam_channel::Receiver<()>,
+    badge: &mut BadgeImage,
+    anchor: Option<ResolvedAnchor>,
+) {
+    loop {
+        crossbeam_channel::select! {
+            recv(enter) -> _ => return,
+            recv(events) -> event => match event {
+                Ok(PlatformEvent::OverlayScaleChanged { dpi }) => {
+                    tracing::info!(dpi, "OverlayScaleChanged during interactive wait");
+                    if let Some(anchor) = anchor {
+                        *badge = synthetic_badge(dpi);
+                        overlay.show(badge, anchor);
+                    }
+                }
+                Ok(other) => tracing::warn!(?other, "unexpected event from the overlay"),
+                Err(_) => {
+                    // A disconnected channel is always ready. Stop selecting it so a
+                    // failed overlay cannot turn the interactive wait into a busy loop.
+                    tracing::warn!("overlay event channel closed; waiting for Enter");
+                    let _ = enter.recv();
+                    return;
+                }
+            },
+        }
+    }
 }
 
 /// Middle of the **primary** monitor, which is a comfortable place to click at.
@@ -310,4 +327,53 @@ fn diagonal_across_the_virtual_desktop() -> Vec<Point> {
             y: top + span_y * step / last,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::{Sender, bounded};
+
+    struct RecordingOverlay(Sender<(u32, u32, u32, ResolvedAnchor)>);
+
+    impl OverlayWindow for RecordingOverlay {
+        fn show(&self, image: &BadgeImage, anchor: ResolvedAnchor) {
+            self.0
+                .send((image.dpi, image.width, image.height, anchor))
+                .expect("record show");
+        }
+
+        fn move_to(&self, _anchor: ResolvedAnchor) {}
+        fn hide(&self) {}
+        fn dpi_for(&self, _anchor: ResolvedAnchor) -> u32 {
+            96
+        }
+    }
+
+    #[test]
+    fn parked_badge_rerenders_before_enter() {
+        let (events_tx, events_rx) = bounded(1);
+        let (enter_tx, enter_rx) = bounded(1);
+        let (shown_tx, shown_rx) = bounded(1);
+        let worker = std::thread::spawn(move || {
+            let mut badge = synthetic_badge(96);
+            wait_with_events(
+                &RecordingOverlay(shown_tx),
+                &events_rx,
+                &enter_rx,
+                &mut badge,
+                Some(ResolvedAnchor::Fixed),
+            );
+        });
+
+        events_tx
+            .send(PlatformEvent::OverlayScaleChanged { dpi: 144 })
+            .expect("send scale change");
+        // Keep Enter pending until after observing the redraw. A blocking stdin-only
+        // wait would leave this request unhandled for the entire interactive phase.
+        let shown = shown_rx.recv_timeout(Duration::from_secs(2));
+        enter_tx.send(()).expect("finish interactive phase");
+        worker.join().expect("waiter exits");
+        assert_eq!(shown, Ok((144, 66, 39, ResolvedAnchor::Fixed)));
+    }
 }
