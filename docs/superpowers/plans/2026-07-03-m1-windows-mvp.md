@@ -32,8 +32,8 @@
 | 10 | overlay.rs + geometry.rs + overlay_smoke — **риск №1 (1/2)** | ✅ сделано | ветка `feat/m1-task10-overlay`; визуальные пункты чеклиста ждут человека |
 | 11 | pointer.rs (Raw Input): бейдж следует за курсором — **риск №1 (2/2)** | ✅ код и native-тесты; визуальный smoke ожидает проверки | `a1aa1f5` |
 | 12 | layout_monitor.rs: 2 источника + взводимый фолбэк — **риск №2** | ✅ код и native-тесты; доставка смен языка требует smoke | `53a397a` |
-| 13 | tsf.rs — третий источник (STA/COM) | ✅ код и native-тесты; глобальная доставка требует smoke | этот коммит |
-| 14 | autostart.rs (HKCU\Run) | ⬜ | |
+| 13 | tsf.rs — третий источник (STA/COM) | ✅ код и native-тесты; глобальная доставка требует smoke | `98bca13` |
+| 14 | autostart.rs (HKCU\Run) | ✅ код; roundtrip в изолированном ключе реестра | этот коммит |
 | 15 | switcher-app — render.rs: растеризация и кэш бейджей | ⬜ | |
 | 16 | switcher-app — sound.rs: синтез двух кью | ⬜ | |
 | 17 | switcher-app — paths.rs + logging.rs | ⬜ | |
@@ -2567,12 +2567,13 @@ RAII: открытый ключ оборачивать в `windows::core::Owned<
 Запустить: `cargo clippy -p switcher-windows --all-targets -- -D warnings`
 Ожидание: чисто; при удалении `Win32_System_Registry` из фич сборка падает.
 
-- [ ] **Шаг 5: smoke — наблюдаемая проверка через `reg query`**
+- [x] **Шаг 5: безопасная проверка чтения и изолированный roundtrip**
 
-`examples/autostart_smoke.rs`: печатает `is_enabled()`, запоминает исходное состояние, делает `set_enabled(true)`, печатает `is_enabled()`, ждёт нажатия Enter (чтобы проверить реестр снаружи), делает `set_enabled(false)`, печатает `is_enabled()`, восстанавливает исходное состояние. В шапке — предупреждение, что пример пишет в реальный `HKCU`.
+Исправление аудита 2026-09-07: восстановление одного boolean после записи в настоящий Run теряло исходную команду существующего значения. Поэтому `examples/autostart_smoke.rs` только читает настоящее состояние, а native-тест создаёт уникальный временный ключ вне Run, проверяет точные байты REG_SZ, повторные включение/выключение и удаление временного ключа. Настоящая запись автозапуска тестами не меняется.
 
-Запустить: `cargo run -p switcher-windows --example autostart_smoke`, а на паузе — `reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v lang-switcher`
-Ожидание: на паузе `reg query` печатает `lang-switcher REG_SZ "…\lang-switcher.exe"` — путь **в кавычках**; после завершения примера та же команда отвечает «не удалось найти указанный раздел или параметр реестра»; `is_enabled()` печатает `true` и `false` в тех же точках. Дополнительный пункт чеклиста: перезагрузиться при включённом автозапуске и убедиться, что процесс поднялся один раз (не дважды) — это проверка того, что значение записано ровно одно.
+Чтение: `cargo run -p switcher-windows --example autostart_smoke`. Native roundtrip: `cargo test -p switcher-windows autostart::tests::native_registry_roundtrip -- --nocapture` (требует доступ к записи HKCU). Проверка запуска при входе в Windows остаётся ручным пунктом после задачи 20.
+
+Реализация дополнительно проверяет лимит Run в 260 UTF-16 единиц для всей команды с кавычками; путь сохраняется через `encode_wide`. Для `RegCreateKeyExW` windows-rs требует также feature `Win32_Security`. Гейты 2026-09-07: fmt, clippy и 111 тестов workspace прошли, native roundtrip выполнен вне sandbox с последующей проверкой удаления ключа. Независимое ревью: замечаний нет.
 
 - [ ] **Шаг 6: гейты и коммит**
 
