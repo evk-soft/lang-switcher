@@ -33,10 +33,10 @@
 | 11 | pointer.rs (Raw Input): бейдж следует за курсором — **риск №1 (2/2)** | ✅ код и native-тесты; визуальный smoke ожидает проверки | `a1aa1f5` |
 | 12 | layout_monitor.rs: 2 источника + взводимый фолбэк — **риск №2** | ✅ код и native-тесты; доставка смен языка требует smoke | `53a397a` |
 | 13 | tsf.rs — третий источник (STA/COM) | ✅ код и native-тесты; глобальная доставка требует smoke | `98bca13` |
-| 14 | autostart.rs (HKCU\Run) | ✅ код; roundtrip в изолированном ключе реестра | этот коммит |
-| 15 | switcher-app — render.rs: растеризация и кэш бейджей | ⬜ | |
-| 16 | switcher-app — sound.rs: синтез двух кью | ⬜ | |
-| 17 | switcher-app — paths.rs + logging.rs | ⬜ | |
+| 14 | autostart.rs (HKCU\Run) | ✅ код; roundtrip в изолированном ключе реестра | `4d53567` |
+| 15 | switcher-app — render.rs: растеризация и кэш бейджей | ✅ код и тесты; визуальная приёмка впереди | этот коммит |
+| 16 | switcher-app — sound.rs: синтез двух кью | ✅ код и тесты; прослушивание впереди | этот коммит |
+| 17 | switcher-app — paths.rs + logging.rs | ✅ включая безопасное сохранение конфига | этот коммит |
 | 18 | switcher-app — tray.rs | ⬜ | |
 | 19 | switcher-app — runtime.rs: цикл ядра и диспетчер эффектов | ⬜ | |
 | 20 | switcher-app — main.rs: сборка всего, end-to-end | ⬜ | |
@@ -2589,6 +2589,8 @@ git commit -m "feat(windows): HKCU Run autostart with explicit WIN32_ERROR mappi
 
 ### Задача 15: switcher-app — render.rs: растеризация бейджа и кэш
 
+**Реализовано 2026-09-07:** Inter v4.1, статический сабсет 15 304 байта, [ADR-0014](../../architecture/adr/0014-embedded-badge-font.md). Модули оболочки экспортирует `src/lib.rs` с `forbid(unsafe_code)` для тестов и wiring. Метки ядра могут содержать Unicode; при любом отсутствующем глифе рисуется цветной квадрат. Семь тестов инвариантов, без golden-байтов.
+
 **Файлы:**
 - Создать: `crates/switcher-app/src/render.rs` — `BadgeMetrics`, `BadgeKey`, `RenderError`, `render_badge`, `measure_label`, `BadgeCache`, `MAX_ENTRIES`
 - Создать: `crates/switcher-app/assets/fonts/<Font>-subset.ttf` — статический (не variable) сабсет `A–Z` + `?` + `0–9`
@@ -2708,6 +2710,8 @@ git commit -m "feat(app): badge rasterizer in premultiplied BGRA with DPI-keyed 
 
 ### Задача 16: switcher-app — sound.rs: два синтезированных кью на rodio 0.22
 
+**Реализовано 2026-09-07:** `SoundDevice::open(tx)` принимает канал событий. Вместо готового helper используется `from_default_device().with_error_callback(...).open_sink_or_fallback()` для регистрации отказа уже открытого потока. После отказа дальнейшие тоны отбрасываются; конфиг звука сохраняет намерение. Владение устройством ограничено главным потоком через `PhantomData<Rc<()>>`. Тест проверяет также конечность, амплитуду и затухание реальных сэмплов без воспроизведения. Стартовый Sound=Ok устанавливается **до** обработки накопленных событий Off.
+
 **Файлы:**
 - Создать: `crates/switcher-app/src/sound.rs` — `SoundDevice`, `RodioSoundPlayer`, `NullSoundPlayer`, `cue_freq_hz`, `effective_gain`
 - Изменить: `docs/smoke/m1-windows.md` — секция «Звук» (файл создан задачей 9)
@@ -2803,6 +2807,8 @@ git commit -m "feat(app): synthesized sound cues with graceful audio-device degr
 ---
 
 ### Задача 17: switcher-app — paths.rs и logging.rs
+
+**Реализовано 2026-09-07:** также добавлен `config_io.rs`, чтобы чтение/сохранение не дублировались в main/runtime. Запись через уникальный временный файл в том же каталоге, `sync_all` и замену `fs::rename`; успешный Windows roundtrip проверен. Нечитаемый, повреждённый или более новый конфиг защищён от записи до перезапуска с исправленным файлом. Каталог создаётся только при сохранении. `logging::init` использует `try_init`, поэтому занятый глобальный subscriber возвращает ошибку. Гейты оболочки: fmt и clippy чистые, 126 тестов workspace прошли.
 
 **Файлы:**
 - Создать: `crates/switcher-app/src/paths.rs` — `AppPaths`, `resolve()`, `layout_from()`, `ensure_config_dir()`
