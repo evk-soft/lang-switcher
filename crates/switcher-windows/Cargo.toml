@@ -18,6 +18,7 @@ tracing = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input",
     # `WNDCLASSW` carries an `HBRUSH`, so the struct and `RegisterClassW` are gated on Gdi
     # even though they live in WindowsAndMessaging.
     "Win32_Graphics_Gdi",
