@@ -34,10 +34,10 @@
 | 12 | layout_monitor.rs: 2 источника + взводимый фолбэк — **риск №2** | ✅ код и native-тесты; доставка смен языка требует smoke | `53a397a` |
 | 13 | tsf.rs — третий источник (STA/COM) | ✅ код и native-тесты; глобальная доставка требует smoke | `98bca13` |
 | 14 | autostart.rs (HKCU\Run) | ✅ код; roundtrip в изолированном ключе реестра | `4d53567` |
-| 15 | switcher-app — render.rs: растеризация и кэш бейджей | ✅ код и тесты; визуальная приёмка впереди | этот коммит |
-| 16 | switcher-app — sound.rs: синтез двух кью | ✅ код и тесты; прослушивание впереди | этот коммит |
-| 17 | switcher-app — paths.rs + logging.rs | ✅ включая безопасное сохранение конфига | этот коммит |
-| 18 | switcher-app — tray.rs | ⬜ | |
+| 15 | switcher-app — render.rs: растеризация и кэш бейджей | ✅ код и тесты; визуальная приёмка впереди | `9025bbc` |
+| 16 | switcher-app — sound.rs: синтез двух кью | ✅ код и тесты; прослушивание впереди | `9025bbc` |
+| 17 | switcher-app — paths.rs + logging.rs | ✅ включая безопасное сохранение конфига | `9025bbc` |
+| 18 | switcher-app — tray.rs | ✅ код и native-контракты; интерактивная приёмка впереди | этот коммит |
 | 19 | switcher-app — runtime.rs: цикл ядра и диспетчер эффектов | ⬜ | |
 | 20 | switcher-app — main.rs: сборка всего, end-to-end | ⬜ | |
 | 21 | приёмка M1: smoke-чеклист и замер NFR | ⬜ | |
@@ -2912,6 +2912,8 @@ git commit -m "feat(app): resolve config/log paths and set up rolling file loggi
 ---
 
 ### Задача 18: switcher-app — трей: меню, иконка, карта возможностей
+
+**Реализовано 2026-09-07:** меню и объекты tray-icon строго на главном потоке; состояние — подменю отдельных строк. Подтверждён native-контракт straight alpha (255,a128 → 128; premul 128,a128 → 64). Дренаж команд дополнен после DispatchMessage, а ограничение sent-modal внутри GetMessage описано в ADR-0009; сам tray-icon посылает WM_NULL после меню. Независимое ревью нашло длинную метку при size=8: добавлена проверка фактических размеров, регрессия red→green. Гейты: fmt/clippy и 133 теста workspace прошли. UI-smoke ожидает задачи 20.
 
 **Файлы:**
 - Создать: `crates/switcher-app/src/menu.rs` — `MenuCommand`, `ids::*`, `command_for(&str)`

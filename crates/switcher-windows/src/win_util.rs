@@ -67,6 +67,12 @@ pub fn current_thread_id() -> u32 {
     unsafe { GetCurrentThreadId() }
 }
 
+/// Publishes a usable wake target before any producer thread starts.
+pub fn current_thread_waker() -> PumpWaker {
+    ensure_message_queue();
+    PumpWaker::new(current_thread_id())
+}
+
 /// Asks the pump on **this** thread to leave its loop. Documented for the same-thread
 /// case: it posts `WM_QUIT`, and the next `GetMessageW` returns 0.
 pub fn post_quit() {
@@ -486,11 +492,17 @@ pub fn pump_with_handler<H: PumpHandler>(
 
 /// Pumps messages on the **calling** thread until it is asked to quit.
 ///
-/// `on_iter` runs once per retrieved message, before the message is dispatched, and is
-/// where a caller drains whatever channel it owns. Note what that implies: `on_iter` only
-/// runs when a message arrives, so a caller must not rely on a posted wake as its only
-/// trigger — thread messages are lost while a modal loop (an open tray menu) is running.
+/// Drain commands initially, before dispatch, and after dispatch returns. The last
+/// drain is essential: a nested modal menu can consume all posted thread wakes.
+/// Commands themselves remain in the caller's channel and must run before blocking.
+/// A modal callback entered by a sent message *inside GetMessageW* must itself post
+/// a message on return; GetMessageW otherwise keeps waiting. tray-icon 0.24.1 does
+/// this with WM_NULL after TrackPopupMenu. This is not a general-purpose modal pump.
 pub fn pump_messages(mut on_iter: impl FnMut() -> PumpVerdict) -> Result<(), PlatformError> {
+    ensure_message_queue();
+    if on_iter() == PumpVerdict::Quit {
+        post_quit();
+    }
     loop {
         let mut msg = MSG::default();
         // SAFETY: as in `run_pump` — a live MSG, no window filter.
@@ -518,6 +530,9 @@ pub fn pump_messages(mut on_iter: impl FnMut() -> PumpVerdict) -> Result<(), Pla
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
+            }
+            if on_iter() == PumpVerdict::Quit {
+                post_quit();
             }
         }
     }
@@ -574,6 +589,78 @@ mod tests {
     }
 
     static WNDPROC_HITS: AtomicUsize = AtomicUsize::new(0);
+    static MODAL_COMMAND_PENDING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    unsafe extern "system" fn modal_test_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        w: WPARAM,
+        l: LPARAM,
+    ) -> LRESULT {
+        crate::supervise::guard_callback(
+            switcher_platform::events::Capability::Overlay,
+            || LRESULT(0),
+            || {
+                if msg == WM_APP + 8 {
+                    let mut discarded = MSG::default();
+                    // SAFETY: live MSG, this thread's queue. Emulate a modal loop consuming
+                    // the thread wake while its corresponding channel command remains.
+                    let got = unsafe {
+                        PeekMessageW(
+                            &mut discarded,
+                            None,
+                            WM_PUMP_WAKE,
+                            WM_PUMP_WAKE,
+                            windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+                        )
+                    };
+                    MODAL_COMMAND_PENDING.store(got.as_bool(), Ordering::Release);
+                    return LRESULT(0);
+                }
+                // SAFETY: untouched arguments delivered by Windows to this window.
+                unsafe { DefWindowProcW(hwnd, msg, w, l) }
+            },
+        )
+    }
+
+    #[test]
+    fn channel_commands_are_drained_after_a_modal_loop_consumes_the_wake() {
+        MODAL_COMMAND_PENDING.store(false, Ordering::Release);
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let thread = std::thread::spawn(move || {
+            let window =
+                HiddenWindow::new("SwitcherModalDrainTest", Some(modal_test_wndproc), None)
+                    .unwrap();
+            let tid = current_thread_id();
+            // SAFETY: the window lives on this thread through the pump, messages have
+            // no pointer arguments. Queue the modal entry before its wake.
+            unsafe { PostMessageW(Some(window.hwnd()), WM_APP + 8, WPARAM(0), LPARAM(0)) }.unwrap();
+            PumpWaker::new(tid).wake().unwrap();
+            ready_tx.send(tid).unwrap();
+            pump_messages(|| {
+                if MODAL_COMMAND_PENDING.swap(false, Ordering::AcqRel) {
+                    let _ = done_tx.send(());
+                    PumpVerdict::Quit
+                } else {
+                    PumpVerdict::Continue
+                }
+            })
+            .unwrap();
+        });
+        let tid = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let completed_without_an_extra_message =
+            done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        if !completed_without_an_extra_message {
+            PumpWaker::new(tid).wake().unwrap();
+        }
+        thread.join().unwrap();
+        assert!(
+            completed_without_an_extra_message,
+            "pump slept with a pending channel command after modal return"
+        );
+    }
     const WM_TEST_PING: u32 = WM_APP + 7;
 
     unsafe extern "system" fn counting_wndproc(
