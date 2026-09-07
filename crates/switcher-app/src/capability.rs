@@ -73,7 +73,7 @@ pub fn compose_status(map: &CapabilityMap) -> Vec<String> {
     }
 }
 
-fn truncate_utf16(text: &str, limit: usize) -> String {
+pub(crate) fn truncate_utf16(text: &str, limit: usize) -> String {
     let mut units = 0;
     text.chars()
         .take_while(|c| {

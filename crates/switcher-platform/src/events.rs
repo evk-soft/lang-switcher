@@ -155,17 +155,15 @@ pub enum PlatformEvent {
         lang: LangTag,
         source: LayoutSource,
     },
-    PointerMoved {
-        pos: Point,
-    },
+    /// Motion notification. Runtime re-reads cursor_pos before moving: this sample
+    /// may have been queued during a previous visible interval.
+    PointerMoved { pos: Point },
     /// The visible badge's image was rendered for a different DPI than the monitor it now
     /// sits on (monitor crossing, or `WM_DPICHANGED` while it sat still). Consumed by
     /// `switcher-app` ONLY: re-rasterize at `dpi`, then call `OverlayWindow::show` again
     /// with the last known anchor. Deliberately NOT mapped to any core event — the core
     /// never learns about DPI (ADR-0005).
-    OverlayScaleChanged {
-        dpi: u32,
-    },
+    OverlayScaleChanged { dpi: u32 },
     /// An adapter lost or regained a capability. Consumed by the app shell ONLY: the core
     /// is never told, because it has no decision to make from it (ADR-0007).
     CapabilityChanged(CapabilityReport),
