@@ -1,4 +1,7 @@
-use super::{SAMPLE_RATE, queue::PcmBuffer};
+use super::{
+    SAMPLE_RATE,
+    queue::{PcmBuffer, playback_reached},
+};
 use switcher_platform::ports::PlatformError;
 use windows::{
     Win32::{
@@ -6,8 +9,8 @@ use windows::{
         Media::Audio::{
             AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
             AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-            IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
-            WAVEFORMATEX, eConsole, eRender,
+            IAudioClient, IAudioClock, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
+            MMDeviceEnumerator, WAVEFORMATEX, eConsole, eRender,
         },
         System::{
             Com::{CLSCTX_ALL, CoCreateInstance},
@@ -37,12 +40,14 @@ pub(super) fn probe() -> Result<(), PlatformError> {
 }
 
 pub(super) struct Burst {
-    // Drop order is significant: service, client, event. Event outlives WASAPI.
+    // Drop order is significant: services, client, event. Event outlives WASAPI.
     render: IAudioRenderClient,
+    clock: IAudioClock,
     client: IAudioClient,
     event: Owned<HANDLE>,
     buffer: PcmBuffer,
     capacity: u32,
+    frequency: u64,
 }
 
 impl Burst {
@@ -96,6 +101,17 @@ impl Burst {
                 client.GetService().map_err(api)?,
             )
         };
+        // SAFETY: initialized client on this STA; the clock service is released before
+        // this client on the same STA. Its frequency defines GetPosition units (ADR-0018).
+        let clock: IAudioClock = unsafe { client.GetService() }.map_err(api)?;
+        // SAFETY: live clock service; scalar output, frequency is constant for this stream.
+        let frequency = unsafe { clock.GetFrequency() }.map_err(api)?;
+        if frequency == 0 {
+            return Err(PlatformError::new(
+                "audio_invalid_clock",
+                "Audio clock frequency is zero",
+            ));
+        }
         if capacity == 0 || !(0..=5_000_000).contains(&latency) {
             return Err(PlatformError::new(
                 "audio_invalid_buffer",
@@ -121,10 +137,12 @@ impl Burst {
         samples.resize(samples.len() + tail, 0);
         let burst = Self {
             render,
+            clock,
             client,
             event,
             buffer: PcmBuffer::new(samples),
             capacity,
+            frequency,
         };
         Ok(burst)
     }
@@ -137,7 +155,31 @@ impl Burst {
         // SAFETY: this initialized client and render service belong to the calling STA.
         let padding = unsafe { self.client.GetCurrentPadding() }.map_err(api)?;
         if self.buffer.drained(padding) {
-            return Ok(true);
+            let mut position = 0;
+            // SAFETY: live clock service on this STA; initialized writable output.
+            // Padding describes the client queue, not the device's playback position.
+            unsafe { self.clock.GetPosition(&mut position, None) }.map_err(api)?;
+            let complete = playback_reached(
+                self.buffer.samples.len(),
+                position,
+                self.frequency,
+                SAMPLE_RATE,
+            );
+            tracing::trace!(
+                position,
+                frequency = self.frequency,
+                complete,
+                "audio client buffer empty"
+            );
+            if complete {
+                tracing::debug!(
+                    frames = self.buffer.samples.len(),
+                    position,
+                    frequency = self.frequency,
+                    "audio device playback complete"
+                );
+            }
+            return Ok(complete);
         }
         let range = self.buffer.next(self.capacity, padding)?;
         let count = range.len() as u32;
