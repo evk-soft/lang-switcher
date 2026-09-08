@@ -1,6 +1,17 @@
 use std::ops::Range;
 use switcher_platform::ports::PlatformError;
 
+pub(super) fn playback_reached(
+    frames: usize,
+    position: u64,
+    frequency: u64,
+    sample_rate: u32,
+) -> bool {
+    frequency != 0
+        && sample_rate != 0
+        && position as u128 * sample_rate as u128 >= frames as u128 * frequency as u128
+}
+
 pub(super) fn update_and_wake(
     mailbox: &std::sync::Mutex<Mailbox>,
     update: impl FnOnce(&mut Mailbox) -> bool,
@@ -68,6 +79,28 @@ impl PcmBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_client_buffer_does_not_finish_a_cue_still_at_the_device() {
+        let mut buffer = PcmBuffer::new(vec![1; 3969]);
+        buffer.submitted(3969);
+        assert!(buffer.drained(0));
+        // Realtek observations: client queue is empty at only 64-70ms of a 90ms cue.
+        assert!(!playback_reached(3969, 5666, 88200, 44100));
+        assert!(!playback_reached(3969, 6200, 88200, 44100));
+        assert!(!playback_reached(3969, 7937, 88200, 44100));
+        assert!(playback_reached(3969, 7938, 88200, 44100));
+        assert!(playback_reached(3969, 8820, 88200, 44100));
+    }
+
+    #[test]
+    fn playback_clock_uses_its_own_units_and_rejects_zero_frequency() {
+        assert!(!playback_reached(3969, 899999, 10000000, 44100));
+        assert!(playback_reached(3969, 900000, 10000000, 44100));
+        assert!(!playback_reached(3969, u64::MAX, 0, 44100));
+        assert!(!playback_reached(3969, u64::MAX, 88200, 0));
+        assert!(playback_reached(1, u64::MAX, u64::MAX, 44100));
+    }
 
     #[test]
     fn revocation_waits_until_an_in_flight_wake_finishes() {
