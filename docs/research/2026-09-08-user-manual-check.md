@@ -111,5 +111,103 @@ stop-file в `finally` скрипта. В снимке есть HWND/class/PID/T
   и Rust 1.87 all-targets/locked прошли. Независимое read-only ревью замечаний
   к окончательным изменениям не нашло.
 
-Полный интерактивный сценарий нового скрипта и прослушивание медленных тонов
-ждут пользователя. Они не помечены как прошедшие автоматическую проверку.
+Этот раздел относится к подготовке сборки `3fa347c`. Последующий ручной результат
+не является успешной приёмкой; он приведён ниже.
+
+## Повторный прогон 11:40–11:45
+
+Пользователь выполнил `scripts/manual-check.ps1`; артефакты:
+`target/manual-guided-20260908-114012010`. Приложение было живым всё время ручных
+этапов и штатно завершилось через трей в 11:45:35.447 (`clean=true`).
+
+- В режиме Follow пользователь подтвердил красный RU и синий EN, а также смену
+  этих бейджей. Снимок показывает RU. Это не подтверждает реакцию на все способы
+  переключения: в Notepad++ бейдж не менялся, в Terminal работал Alt+Shift,
+  но не Win+Space, хотя пользователь отдельно проверил фактический язык ввода.
+- Все 20 отдельных сигналов `audio_smoke --audible` пользователь **не услышал**.
+  Native completion 20/20 не считается проверкой слышимости. Сигналов приложения
+  пользователь также не услышал.
+- Fixture приняла лишь первый переход в EN и завершилась с exit 1:
+  `fixture lost foreground; stopped without changing another window`.
+  Уже через 19 мс после снимка EN foreground вернулся в Terminal. Это не тест
+  из 20 смен. Пользователь видел, как окно появилось и сразу закрылось.
+
+Независимый разбор сопоставил все изменения HKL в probe с приложением:
+
+| Этап (время UTC) | Наблюдение |
+|---|---|
+| Notepad++ / Scintilla, 08:43:24.050–08:43:32.638 | 91 стабильный снимок; top и focus принадлежат TID 28616, оба HKL всё время RU; приложение отключило fallback для обычного Win32-окна |
+| Terminal, 08:44:16.917–08:45:22.212 | 674 стабильных снимка; top/focus TID 17548 и HKL совпадают во всех снимках |
+| Terminal RU→EN | Probe: между 08:44:38.221 и 08:44:38.322; приложение прочитало EN в 08:44:38.359692 |
+| Terminal EN→RU | Probe: между 08:44:52.145 и 08:44:52.246; приложение прочитало RU в 08:44:52.358592 |
+
+Ещё четыре изменения в `notepad-probe.txt` произошли после возврата в Terminal;
+все они также прочитаны приложением. Итого **6/6 доступных внешнему HKL-читателю
+изменений** обработаны через ForegroundPoll. Сырых Shell code 8 нет (при наличии
+132 и 24 других shell-сообщений на ручных этапах), сырых TSF callbacks нет вовсе.
+Точные нажатия клавиш не записывались; приписать каждое измеренное изменение
+определённой комбинации нельзя.
+
+Замена top-TID на focus-TID сама по себе не исправляет этот прогон: они совпадают.
+Учитывая проверку реального ввода пользователем, надо исследовать состояние TSF,
+которое может расходиться с читаемым внешним процессом Win32 HKL. Учащение того же
+опроса не создаст отсутствующие данные. Подтверждения универсального внешнего
+getters/источника событий пока нет.
+
+## Изменения и дополнительные проверки после результата
+
+В DEBUG-журнал аудио добавлено название и непрозрачный ID выбранного endpoint,
+его громкость/mute, громкость/mute **сессии этого клиента**, число исходных PCM
+кадров, пик и сообщённая WASAPI задержка. Только чтение, никаких setters или
+постоянного таймера. Ошибка диагностического getter не прерывает воспроизведение;
+в штатном INFO-режиме эти дополнительные COM-запросы не выполняются.
+
+Беззвучный прогон `target/audio-routing-20260908-115455402` завершён с exit 0:
+20/20, выбран `Speakers (3- Realtek(R) Audio)`, endpoint 0.88/unmuted,
+session 1.0/unmuted. `GetStreamLatency` вернул 0, capacity 1036. PCM peak=0
+ожидаем в **беззвучном** режиме. Это текущее состояние отдельного тестового
+процесса, а не ретроспективное измерение ручного прогона или доказательство
+настроек сессии основного EXE. У пользователя запрошено фактическое устройство
+прослушивания для сопоставления с выбранным выходом.
+
+Отдельно проверено основное release-приложение с временным конфигом,
+`sound.enabled=false` и `--run-for 3`:
+`target/app-audio-routing-20260908-120212165`. Его собственная сессия также
+1.0/unmuted на том же Realtek endpoint 0.88/unmuted. Звуковой stream не запускался,
+процесс завершился с exit 0 и `clean=true`, stderr пуст. Значения относятся
+к этой проверке, не к прошлому прослушиванию. При включённом DEBUG синхронные
+диагностические запросы перед Start могут добавлять задержку; такой режим
+не подходит для сравнения задержки с прежними INFO-замерами.
+
+Контракты: [GetDefaultAudioEndpoint](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immdeviceenumerator-getdefaultaudioendpoint),
+[GetService](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-getservice),
+[ISimpleAudioVolume](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-isimpleaudiovolume),
+[IAudioEndpointVolume](https://learn.microsoft.com/en-us/windows/win32/api/endpointvolume/nn-endpointvolume-iaudioendpointvolume),
+[GetId / CoTaskMemFree](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immdevice-getid),
+[имя endpoint](https://learn.microsoft.com/en-us/windows/win32/coreaudio/pkey-device-friendlyname),
+[PropVariantToString](https://learn.microsoft.com/en-us/windows/win32/api/propvarutil/nf-propvarutil-propvarianttostring),
+[PropVariantClear](https://learn.microsoft.com/en-us/windows/win32/api/propidl/nf-propidl-propvariantclear).
+
+Fixture теперь собирается как Windows GUI subsystem: её запуск не должен создавать
+второе консольное окно, способное забрать фокус у собственного тестового окна.
+Защита остановки при потере foreground сохранена. Сам по себе этот параметр
+сборки не доказывает, что повторный интерактивный прогон удержит фокус 20 смен.
+
+Отдельный исследовательский процесс в ignored `target/tsf-investigation` проверил
+адресный [ITfLangBarMgr::GetInputProcessorProfiles](https://learn.microsoft.com/en-us/windows/win32/api/ctfutb/nf-ctfutb-itflangbarmgr-getinputprocessorprofiles).
+На текущем foreground вернулся запрошенный ненулевой TID, EN и keyboard profile
+EN; три секунды без смен завершились с exit 0
+(`target/tsf-state-20260908-115753746`). Это только проверка доступности API,
+не доказательство отслеживания Win+Space. В продукт этот читатель не включён.
+
+Проверки окончательных изменений:
+
+- fmt-check, Clippy workspace/all-targets `-D warnings`, 152 теста и
+  Rust 1.87 workspace/all-targets/locked прошли. Первый запуск тестов в sandbox
+  не имел доступа к изолированному тестовому ключу HKCU; повтор с разрешённым
+  доступом прошёл. Настоящий ключ автозапуска этот тест не затрагивает.
+- Release приложения, audio_smoke и fixture собраны; EXE приложения —
+  2 874 368 байт. В PE fixture проверено значение subsystem=2 (GUI).
+- Независимое read-only ревью аудиодиагностики не нашло подтверждённых ошибок
+  времени жизни COM/строк/variant или изменения громкости/PCM/routing.
+- Слышимость, реакция на Win+Space и полный повтор fixture **не подтверждены**.

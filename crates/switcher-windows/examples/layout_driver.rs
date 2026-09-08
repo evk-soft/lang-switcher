@@ -1,5 +1,9 @@
 //! Controlled external foreground fixture for app/layout_smoke acceptance.
 //! Changes only its own window using already installed HKLs; no keyboard injection.
+// This fixture owns a GUI window. A second console/Terminal window can otherwise
+// finish opening after SetForegroundWindow and take focus back during the test.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 #[cfg(windows)]
 mod native {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
