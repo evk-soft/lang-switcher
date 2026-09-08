@@ -1,6 +1,6 @@
 use super::{
     SAMPLE_RATE,
-    queue::{PcmBuffer, playback_reached},
+    queue::{PcmBuffer, playback_reached, render_buffer},
 };
 use switcher_platform::ports::PlatformError;
 use windows::{
@@ -59,7 +59,7 @@ impl Burst {
         Ok(burst)
     }
 
-    fn prepare(mut samples: Vec<i16>) -> Result<Self, PlatformError> {
+    fn prepare(samples: Vec<i16>) -> Result<Self, PlatformError> {
         // SAFETY: unnamed auto-reset event, initially nonsignalled; no security descriptor.
         let handle = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.map_err(api)?;
         // SAFETY: newly created event is uniquely owned and closed after all COM clients.
@@ -132,15 +132,13 @@ impl Burst {
                 "audio source buffer"
             );
         }
-        // Include the reported device latency as a silent tail, not a wall-clock guess.
-        let tail = (latency as u64 * SAMPLE_RATE as u64).div_ceil(10_000_000) as usize;
-        samples.resize(samples.len() + tail, 0);
+        let buffer = render_buffer(samples, SAMPLE_RATE, latency as u64);
         let burst = Self {
             render,
             clock,
             client,
             event,
-            buffer: PcmBuffer::new(samples),
+            buffer,
             capacity,
             frequency,
         };

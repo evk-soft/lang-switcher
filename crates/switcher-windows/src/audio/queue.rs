@@ -1,6 +1,22 @@
 use std::ops::Range;
 use switcher_platform::ports::PlatformError;
 
+pub(super) fn render_buffer(
+    mut samples: Vec<i16>,
+    sample_rate: u32,
+    latency_100ns: u64,
+) -> PcmBuffer {
+    if !samples.is_empty() {
+        // Realtek dropped a complete 90ms cue at zero reported latency. Keep a
+        // bounded 100ms release tail, or the greater validated device latency.
+        // This is measured compatibility policy, not an API guarantee (ADR-0020).
+        let release_100ns = latency_100ns.max(1_000_000);
+        let tail = (release_100ns * sample_rate as u64).div_ceil(10_000_000) as usize;
+        samples.resize(samples.len() + tail, 0);
+    }
+    PcmBuffer::new(samples)
+}
+
 pub(super) fn playback_reached(
     frames: usize,
     position: u64,
@@ -79,6 +95,38 @@ impl PcmBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_short_cue_keeps_a_silent_release_tail_even_when_latency_is_zero() {
+        let cue: Vec<i16> = (0..3969).map(|i| (i % 123) as i16).collect();
+        let mut buffer = render_buffer(cue.clone(), 44100, 0);
+        assert_eq!(&buffer.samples[..cue.len()], cue.as_slice());
+        buffer.submitted(cue.len());
+        assert!(
+            !buffer.drained(0),
+            "the 90ms clock endpoint lost the entire cue in the Realtek control"
+        );
+        assert_eq!(buffer.samples.len(), 8379);
+        assert!(
+            buffer.samples[cue.len()..]
+                .iter()
+                .all(|&sample| sample == 0)
+        );
+        assert!(!playback_reached(buffer.samples.len(), 7938, 88200, 44100));
+        buffer.submitted(buffer.samples.len());
+        assert!(buffer.drained(0));
+        assert!(playback_reached(buffer.samples.len(), 16758, 88200, 44100));
+    }
+
+    #[test]
+    fn release_tail_honors_longer_latency_and_does_not_turn_a_probe_into_audio() {
+        let reported = render_buffer(vec![7], 44100, 2_000_001);
+        assert_eq!(reported.samples.len(), 1 + 8821);
+        let minimum = render_buffer(vec![7], 48000, 0);
+        assert_eq!(minimum.samples.len(), 1 + 4800);
+        let probe = render_buffer(Vec::new(), 44100, 5_000_000);
+        assert!(probe.samples.is_empty());
+    }
 
     #[test]
     fn an_empty_client_buffer_does_not_finish_a_cue_still_at_the_device() {
