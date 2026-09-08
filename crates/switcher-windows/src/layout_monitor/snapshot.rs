@@ -3,6 +3,7 @@
 use switcher_platform::events::{LangTag, LayoutId};
 use switcher_platform::ports::PlatformError;
 use windows::Win32::Globalization::LCIDToLocaleName;
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -10,6 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThre
 struct Foreground {
     hwnd: usize,
     tid: u32,
+    owned: bool,
 }
 
 fn read_stable(
@@ -23,6 +25,12 @@ fn read_stable(
                 "no foreground thread is available",
             )
         })?;
+        if before.owned {
+            return Err(PlatformError::new(
+                "foreground_is_own",
+                "own UI has focus; retain the last foreign layout",
+            ));
+        }
         let value = layout(before.tid).ok_or_else(|| {
             PlatformError::new("layout_read_failed", "GetKeyboardLayout returned NULL")
         })?;
@@ -44,7 +52,11 @@ pub(super) fn current_if_foreground(
     hwnd: usize,
     tid: u32,
 ) -> Result<(LayoutId, LangTag), PlatformError> {
-    read_expected(Some(Foreground { hwnd, tid }))
+    read_expected(Some(Foreground {
+        hwnd,
+        tid,
+        owned: false,
+    }))
 }
 
 fn read_expected(expected: Option<Foreground>) -> Result<(LayoutId, LangTag), PlatformError> {
@@ -57,13 +69,17 @@ fn read_expected(expected: Option<Foreground>) -> Result<(LayoutId, LangTag), Pl
             if hwnd.is_invalid() {
                 return None;
             }
-            // SAFETY: borrowed HWND is queried without dereferencing it; zero is checked.
-            let tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
+            let mut pid = 0;
+            // SAFETY: borrowed HWND with initialized PID output; no process is opened.
+            let tid = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+            // SAFETY: read-only identifier of this process, independent of thread.
+            let owned = pid == unsafe { GetCurrentProcessId() };
             let observed = Foreground {
                 hwnd: hwnd.0 as usize,
                 tid,
+                owned,
             };
-            (tid != 0).then_some(observed)
+            (tid != 0 && pid != 0).then_some(observed)
         },
         |tid| {
             // SAFETY: nonzero foreground TID from the preceding observation. No layout
@@ -104,8 +120,53 @@ pub(crate) fn language_for(layout: LayoutId) -> LangTag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const A: Foreground = Foreground { hwnd: 1, tid: 10 };
-    const B: Foreground = Foreground { hwnd: 2, tid: 20 };
+    const A: Foreground = Foreground {
+        hwnd: 1,
+        tid: 10,
+        owned: false,
+    };
+    const B: Foreground = Foreground {
+        hwnd: 2,
+        tid: 20,
+        owned: false,
+    };
+
+    #[test]
+    fn opening_our_tray_menu_never_reads_its_own_layout() {
+        let own = Foreground {
+            hwnd: 3,
+            tid: 30,
+            owned: true,
+        };
+        let mut read = Vec::new();
+        let result = read_stable(
+            || Some(own),
+            |tid| {
+                read.push(tid);
+                Some(LayoutId(3))
+            },
+        );
+        assert!(
+            result.is_err(),
+            "own foreground must retain the previous foreign layout"
+        );
+        assert!(read.is_empty(), "do not query the tray thread's HKL");
+
+        let mut observations = [A, own, own].into_iter();
+        let result = read_stable(
+            || observations.next(),
+            |tid| {
+                read.push(tid);
+                Some(LayoutId(1))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            read,
+            [A.tid],
+            "a race to our menu must not retry with our HKL"
+        );
+    }
 
     #[test]
     fn conditional_poll_never_reads_a_replacement_foreground() {

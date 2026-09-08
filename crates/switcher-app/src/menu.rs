@@ -3,6 +3,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCommand {
     ToggleFollow,
+    ToggleLayoutFallback,
     ToggleSound,
     ToggleAutostart,
     Quit,
@@ -10,6 +11,7 @@ pub enum MenuCommand {
 
 pub mod ids {
     pub const FOLLOW: &str = "follow";
+    pub const LAYOUT_FALLBACK: &str = "layout_fallback";
     pub const SOUND: &str = "sound";
     pub const AUTOSTART: &str = "autostart";
     pub const QUIT: &str = "quit";
@@ -19,6 +21,7 @@ pub mod ids {
 pub fn command_for(id: &str) -> Option<MenuCommand> {
     match id {
         ids::FOLLOW => Some(MenuCommand::ToggleFollow),
+        ids::LAYOUT_FALLBACK => Some(MenuCommand::ToggleLayoutFallback),
         ids::SOUND => Some(MenuCommand::ToggleSound),
         ids::AUTOSTART => Some(MenuCommand::ToggleAutostart),
         ids::QUIT => Some(MenuCommand::Quit),
@@ -32,6 +35,10 @@ mod tests {
     #[test]
     fn only_actionable_ids_produce_commands() {
         assert_eq!(command_for(ids::FOLLOW), Some(MenuCommand::ToggleFollow));
+        assert_eq!(
+            command_for(ids::LAYOUT_FALLBACK),
+            Some(MenuCommand::ToggleLayoutFallback)
+        );
         assert_eq!(command_for(ids::SOUND), Some(MenuCommand::ToggleSound));
         assert_eq!(
             command_for(ids::AUTOSTART),

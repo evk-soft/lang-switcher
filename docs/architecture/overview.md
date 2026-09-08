@@ -1,6 +1,6 @@
 # Архитектура lang-switcher
 
-Обновлено: 2026-09-07. Решения зафиксированы в [ADR](adr/); продуктовые требования — в [дизайн-спеке](../superpowers/specs/2026-07-03-lang-switcher-design.md).
+Обновлено: 2026-09-08. Решения зафиксированы в [ADR](adr/); продуктовые требования — в [дизайн-спеке](../superpowers/specs/2026-07-03-lang-switcher-design.md).
 
 Перед передачей уведомления о раскладке ядру рантайм перечитывает текущий снимок через
 `LayoutMonitor::current()`. Ядро удаляет только повторы текущего HKL; временного подавления
@@ -12,8 +12,12 @@
 сбое всех возможностей своего потока ([ADR-0012](adr/0012-stoppable-source-supervision.md)).
 Регистрация shell hook сама по себе пока означает `Degraded`: источник получает
 `Ok` только после первого `HSHELL_LANGUAGE`. Это отделяет установленную подписку
-от фактически наблюдаемой доставки. Условный опрос связывает проверку окна и
+от фактически наблюдаемой доставки. Резервное чтение связывает проверку окна и
 снимок с одной парой HWND/TID и пропускает результат при гонке переднего плана.
+Открытие собственного меню сохраняет последнюю чужую раскладку без звука.
+По [ADR-0019](adr/0019-configurable-layout-fallback.md) на Windows резервная
+проверка каждые 200 мс включена по умолчанию и отключается из трея. Наличие
+Shell/TSF callback не доказывает надёжную доставку будущих смен и не снимает таймер.
 
 ## Принцип
 
@@ -39,7 +43,7 @@ lang-switcher/
 
 | Трейт | Контракт |
 |---|---|
-| `LayoutMonitor` | `current()` — синхронное чтение при старте и каждом уведомлении; `LayoutChanged { layout, lang, source }` идёт в канал адаптера, payload не заменяет свежий снимок; взводимое исключение опроса — ADR-0003 |
+| `LayoutMonitor` | `current()` — синхронное чтение при старте и каждом уведомлении; `LayoutChanged { layout, lang, source }` идёт в канал адаптера, payload не заменяет свежий снимок; `set_fallback_enabled(bool)` меняет предпочтение резервной проверки (ADR-0019) |
 | `PointerTracker` | `set_active(bool)`, `cursor_pos()`; события `PointerMoved { pos }` — **только** пока бейдж видим |
 | `CaretLocator` | best-effort `caret_point() -> Option<Point>`; всегда может вернуть `None`. В M1 — `NullCaretLocator` |
 | `OverlayWindow` | `show(&BadgeImage, ResolvedAnchor)`, `move_to(ResolvedAnchor)`, `hide()`, `dpi_for(ResolvedAnchor)`; click-through, topmost, без фокуса. **Владеет всей геометрией** (ADR-0005) |
@@ -95,7 +99,7 @@ tray-icon ([ADR-0017](adr/0017-disable-unused-tray-hover.md)).
 
 ### Windows (M1) — подробности в ADR-0004
 
-- **Раскладка:** скрытое message-only окно; `RegisterShellHookWindow` → `HSHELL_LANGUAGE`; `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` → перечитать `GetKeyboardLayout(поток переднего окна)` (раскладка на Windows — per-thread!); TSF `ITfInputProcessorProfileActivationSink` на собственном STA с `Agile = false` (ADR-0013); глобальная доставка смен RU/EN ещё требует smoke. Фолбэк-поллинг 500 мс взводится **только** пока передний план — elevated/UWP/консоль; решение принимается на уже пришедшем `EVENT_SYSTEM_FOREGROUND`, лестницей «мёртвое окно → наш процесс → известные слепые классы → `OpenProcess(PROCESS_QUERY_INFORMATION)` → `GetPackageFullName`», при любой неопределённости — взводить (ADR-0007).
+- **Раскладка:** скрытое message-only окно; `RegisterShellHookWindow` → `HSHELL_LANGUAGE`; `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` → перечитать `GetKeyboardLayout(поток переднего окна)` (раскладка на Windows — per-thread!); TSF `ITfInputProcessorProfileActivationSink` на собственном STA с `Agile = false` (ADR-0013). По ADR-0019 включённый резервный таймер 200 мс работает для любого валидного чужого foreground, включая обычный Win32. При рабочем foreground hook собственное/отсутствующее окно снимает таймер; при отказе hook он остаётся для обнаружения нового окна, но не читает собственный или нулевой TID. Выключение из трея полностью снимает резервный опрос, подписки продолжают работать. Управляющее состояние защищено mutex, wake отзывается до выхода layout-потока; при рестарте источника применяется последнее предпочтение. Process/package probes удалены. Реальная доставка Win+Space/Alt+Shift в полном приложении ещё требует smoke.
 - **Оверлей:** сырое layered-окно `WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW|WS_EX_TOPMOST`; бейджи растеризуются оболочкой в **premultiplied BGRA** под конкретный DPI и кэшируются (ADR-0006 — именно BGRA, потому что 32bpp `BI_RGB` DIB на little-endian это `B,G,R,A`); вывод через `UpdateLayeredWindow` только при смене — он меняет позицию, размер и содержимое одним вызовом; перемещение без смены размера — `SetWindowPos(SWP_NOACTIVATE|SWP_NOSIZE|SWP_NOZORDER)`, `SWP_ASYNCWINDOWPOS` запрещён.
 - **Курсор:** Raw Input (`RegisterRawInputDevices`, `RIDEV_INPUTSINK`) — не `WH_MOUSE_LL` (система молча снимает медленные хуки). Взводится только пока бейдж видим; коалесценция дренажом очереди без таймера; фактическая частота при движении ещё требует замера. При снятии подписки `hwndTarget` обязан быть NULL, иначе `RIDEV_REMOVE` провалится и подписка тихо останется.
 - **Устойчивость:** тело каждого потока хука обёрнуто в `catch_unwind` с backoff 250/1000/4000 мс и сбросом бюджета после 60 с работы; исчерпание бюджета гасит источник и сообщает об этом в трей через `CapabilityChanged`. Одного внешнего `catch_unwind` **недостаточно**: работа хуков исполняется внутри наших же `extern "system"` колбэков (wndproc, `WINEVENTPROC`), а разворачивание через не-`unwind` FFI-границу с Rust 1.81 аборт процесса — поэтому каждый колбэк ловит панику у себя и возвращает безопасный результат, иначе внешний перехват не сработает никогда. `panic = "abort"` в профилях сборки запрещён как необходимое условие всего этого (ADR-0007).
@@ -113,6 +117,11 @@ X11 — полноценно: `XkbSelectEventDetails(XkbStateNotify)`, override-
 ## Конфигурация
 
 TOML в платформенном каталоге конфигов (`directories`): режим бейджа (transient/follow), якорь (auto/cursor/fixed), вид (текст RU/EN | флаг | цвет), длительность показа, звук вкл/выкл + громкость (выбор сэмплов — M2: в M1 кью синтезируются), автозапуск, уровень логов, язык интерфейса. Ядро валидирует и мигрирует версии конфига.
+
+`[layout] fallback_enabled = true` — резервное чтение Windows. Галка
+«Резервная проверка раскладки» немедленно применяет и сохраняет значение;
+старый TOML без поля получает true. Ошибка адаптера отражается отдельно от
+предпочтения. При выключении runtime также отбрасывает уже queued ForegroundPoll.
 
 ## Тестирование
 

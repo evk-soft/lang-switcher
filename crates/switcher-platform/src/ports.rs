@@ -30,7 +30,12 @@ pub trait LayoutMonitor: Send {
     /// when called from the runtime thread. Used at startup and on each layout
     /// notification; `LayoutId` and `LangTag` must describe the same read (ADR-0011).
     /// On error the runtime retains its last accepted state, never a queued payload.
+    /// `foreground_is_own` means our UI temporarily owns focus and is not a failure.
     fn current(&self) -> Result<(LayoutId, LangTag), PlatformError>;
+    /// Records the persisted fallback preference and requests that the adapter's owning
+    /// worker apply it. A successful return confirms that the request was accepted;
+    /// later native failures are reported through `PlatformEvent::CapabilityChanged`.
+    fn set_fallback_enabled(&self, enabled: bool) -> Result<(), PlatformError>;
 }
 
 /// Streams `PlatformEvent::PointerMoved` while armed. Disarmed by default: zero idle cost.
