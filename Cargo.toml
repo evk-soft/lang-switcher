@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["vendor/tray-icon"]
+
+[patch.crates-io]
+tray-icon = { path = "vendor/tray-icon" }
 
 [workspace.package]
 version = "0.1.0"
@@ -29,8 +33,7 @@ directories = "6.0"
 # flags from switcher-app's build.rs (ADR-0010).
 tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
 ab_glyph = { version = "0.2", default-features = false, features = ["std"] }
-rodio = { version = "0.22", default-features = false, features = ["playback"] }
-tray-icon = { version = "0.24", default-features = false }
+tray-icon = { version = "=0.24.1", default-features = false }
 # The only default feature of `windows` is `std`, and it is needed.
 windows = "0.62"
 windows-core = { version = "0.62", default-features = false, features = ["std"] }

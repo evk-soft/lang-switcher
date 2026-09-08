@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use tracing_appender::{
-    non_blocking::WorkerGuard,
+    non_blocking::{NonBlockingBuilder, WorkerGuard},
     rolling::{RollingFileAppender, Rotation},
 };
 use tracing_subscriber::{EnvFilter, filter::LevelFilter};
@@ -27,7 +27,12 @@ pub fn init(log_dir: &Path, level: &str) -> Result<WorkerGuard, LogError> {
         .filename_suffix("log")
         .max_log_files(7)
         .build(log_dir)?;
-    let (writer, guard) = tracing_appender::non_blocking(appender);
+    // The default 128,000-slot queue preallocates about 4 MiB even with no log traffic.
+    // Bound bursts without blocking native callbacks; overload stays lossy as before.
+    let (writer, guard) = NonBlockingBuilder::default()
+        .buffered_lines_limit(1024)
+        .lossy(true)
+        .finish(appender);
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::builder()

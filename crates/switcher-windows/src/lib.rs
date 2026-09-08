@@ -2,7 +2,9 @@
 //! every unsafe block carries a `// SAFETY:` comment (workspace lint enforces it).
 #![cfg(windows)]
 
+pub mod audio;
 pub mod autostart;
+pub mod com;
 pub mod dpi;
 pub mod layout_monitor;
 pub mod overlay;

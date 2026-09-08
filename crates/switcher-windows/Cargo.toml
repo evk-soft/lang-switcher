@@ -25,6 +25,9 @@ windows = { workspace = true, features = [
     "Win32_Globalization",
     "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Media_Audio",
     "Win32_UI_TextServices",
     "Win32_System_Registry",
     # RegCreateKeyExW includes SECURITY_ATTRIBUTES, even when supplied as None.
@@ -42,6 +45,7 @@ windows = { workspace = true, features = [
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
+tray-icon = { workspace = true }
 # The examples are this crate's only smoke harness: no unit test can see click-through,
 # focus theft or a monitor crossing. They need a subscriber installed, or the very log lines
 # the checklist asks the reader to look for would go nowhere.

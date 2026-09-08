@@ -1,4 +1,4 @@
-//! Windows assembly. Native objects and the audio device live on the main thread.
+//! Windows assembly. Tray and first STA live on main; core joins native service owners.
 
 use crate::{
     capability::{CapabilityMap, compose_status},
@@ -7,7 +7,7 @@ use crate::{
     paths::{self, AppPaths},
     render::{BadgeCache, BadgeMetrics, FONT},
     runtime::{self, Ports, Runtime, TraySender},
-    sound::{NullSoundPlayer, SoundDevice},
+    sound::{NullSoundPlayer, SoundDevice, WasapiSoundPlayer},
     tray::{self, Checks, TrayCommand, TrayInit},
 };
 use anyhow::{Context, bail};
@@ -140,17 +140,15 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         ));
     }
     let mut caps = CapabilityMap::default();
+    // The first STA must close last, including audio failure and TSF supervision retries.
+    let _main_apartment = switcher_windows::com::StaApartment::new()?;
     let quit_window = switcher_windows::quit_signal::QuitWindow::new()?;
     // Startup Sound=Ok lives in caps before processing any asynchronous stream Off.
     let (sound_device, sound): (Option<SoundDevice>, Box<dyn SoundPlayer>) =
         match SoundDevice::open(events_tx.clone()) {
-            Ok((device, player)) => (Some(device), Box::new(player)),
+            Ok((device, player)) => (Some(device), Box::new(WasapiSoundPlayer(player))),
             Err(error) => {
-                unavailable(
-                    &mut caps,
-                    Capability::Sound,
-                    PlatformError::new("no_output_device", error.to_string()),
-                );
+                unavailable(&mut caps, Capability::Sound, error);
                 (None, Box::new(NullSoundPlayer))
             }
         };
@@ -242,6 +240,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         .name("core".into())
         .spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _sound_device = sound_device;
                 let _tsf_source = tsf;
                 runtime::run(runtime, events_rx, menu_rx, stop_rx);
             }));
@@ -249,7 +248,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                 tracing::error!("core thread panicked; shutting down");
             }
             tray_sender.send(TrayCommand::Shutdown);
-            // Sent only after all native port/TSF owners dropped and joined their pumps.
+            // Sent only after all native port/TSF/audio owners dropped and joined their pumps.
             let _ = done_tx.send(outcome.is_ok());
         })
         .context("could not create the core thread")?;
@@ -264,13 +263,15 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         Ok(clean) => clean,
         Err(error) => {
             tracing::error!(%error, "native threads did not acknowledge shutdown within 5 seconds");
+            // Fatal shutdown: children may still own COM apartments. Preserve the first
+            // STA until process exit instead of uninitializing it ahead of live children.
+            std::mem::forget(_main_apartment);
             return Err(error).context("native shutdown timed out or failed");
         }
     };
     worker
         .join()
         .map_err(|_| anyhow::anyhow!("core completion thread panicked"))?;
-    drop(sound_device);
     drop(events_tx);
     tracing::info!(clean, "lang-switcher stopped");
     tray_result?;

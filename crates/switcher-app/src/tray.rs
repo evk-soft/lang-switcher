@@ -101,6 +101,7 @@ pub fn run_tray(
         .with_tooltip(init.tooltip)
         .with_icon(Icon::from_rgba(init.rgba, init.size, init.size)?)
         .with_menu_on_left_click(true)
+        .with_hover_tracking(false) // No unused Enter/Move/Leave timer; see ADR-0017.
         .build()?;
     tracing::info!("tray ready");
     pump_messages(|| {
