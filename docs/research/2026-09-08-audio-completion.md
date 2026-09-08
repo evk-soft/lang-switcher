@@ -70,7 +70,8 @@ Stop по-прежнему прерывает текущий сигнал, а wa
   `target/audio-clock-audible-20260908-121853579`. Все 20 коротких RU/EN
   достигли отметки 7938/88200, started=completed=20, active=false, exit 0,
   stderr пуст. Завершение с живым sender и активным тестовым stream — 186 мс.
-  Ответ пользователя именно о слышимости этой серии ожидается.
+  Пользователь отдельно подтвердил: эта последняя серия слышна, низкий и
+  высокий тон различаются (ответ «да» на вопрос после исправления).
 - fmt-check, Clippy all-targets `-D warnings`, workspace/all-targets tests и
   Rust 1.87 all-targets/locked прошли. 154 основных теста плюс 9 повторных тестов
   исходных модулей, включённых в audio_compare. Лог: `target/verification-audio-clock.txt`.
