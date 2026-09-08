@@ -102,6 +102,20 @@ impl Burst {
                 "Audio buffer or latency is outside the supported bounds",
             ));
         }
+        super::diagnostics::log_output(&device, &client);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                frames = samples.len(),
+                peak = samples
+                    .iter()
+                    .map(|sample| sample.unsigned_abs())
+                    .max()
+                    .unwrap_or(0),
+                capacity,
+                latency_100ns = latency,
+                "audio source buffer"
+            );
+        }
         // Include the reported device latency as a silent tail, not a wall-clock guess.
         let tail = (latency as u64 * SAMPLE_RATE as u64).div_ceil(10_000_000) as usize;
         samples.resize(samples.len() + tail, 0);

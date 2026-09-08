@@ -28,6 +28,10 @@ windows = { workspace = true, features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_Media_Audio",
+    # Read-only audio routing/volume diagnostics, emitted only at DEBUG level.
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_TextServices",
     "Win32_System_Registry",
     # RegCreateKeyExW includes SECURITY_ATTRIBUTES, even when supplied as None.

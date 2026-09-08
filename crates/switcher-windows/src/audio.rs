@@ -1,4 +1,5 @@
 //! Demand-driven shared WASAPI output (ADR-0016).
+mod diagnostics;
 mod queue;
 mod stream;
 
