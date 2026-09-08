@@ -156,6 +156,8 @@ impl ITfInputProcessorProfileActivationSink_Impl for ActivationSink_Impl {
             Capability::LayoutTsf,
             || Ok(()),
             || {
+                // Keep callback arrival distinct from accepted activation events.
+                tracing::trace!(target: "switcher_windows::tsf", profile_type, flags, ?hkl, "TSF callback received");
                 if flags & TF_IPSINK_FLAG_ACTIVE == 0 {
                     return Ok(());
                 }
