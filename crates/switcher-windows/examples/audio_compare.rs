@@ -1,5 +1,8 @@
 //! Bounded listening experiment; uses the production PCM/stream source unchanged.
-//! A uses the production worker. B/C/D/E use the stream without its mailbox/worker prewarm.
+//! A uses the production worker. Other cases use the stream without its mailbox/prewarm.
+//! T0..T1000 append that many additional milliseconds to the same short cue.
+//! All cases also receive the current production release tail inside Burst;
+//! T0 is not a no-tail baseline after ADR-0020.
 //! Endpoint peak measures all output, not a recording or proof of physical audibility.
 use std::{
     fs::File,
@@ -61,7 +64,17 @@ fn samples(case: &str) -> Result<Vec<i16>, Box<dyn std::error::Error>> {
                 (phase.sin() * fade * 0.4 * i16::MAX as f32).round() as i16
             })
             .collect(),
-        _ => return Err("case must be A, B, C, D or E".into()),
+        _ if case.starts_with('T') => {
+            let tail_ms: u32 = case[1..].parse()?;
+            if tail_ms > 1000 {
+                return Err("diagnostic tail must be 0..1000 milliseconds".into());
+            }
+            let mut data = cue;
+            let tail_frames = (tail_ms as u64 * SAMPLE_RATE as u64).div_ceil(1000);
+            data.resize(data.len() + tail_frames as usize, 0);
+            data
+        }
+        _ => return Err("case must be A, B, C, D, E or T0..T1000".into()),
     })
 }
 
@@ -105,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let case = args
         .next()
-        .ok_or("usage: audio_compare A|B|C|D|E NEW_WAV [--prepare-only]")?;
+        .ok_or("usage: audio_compare A|B|C|D|E|T0..T1000 NEW_WAV [--prepare-only]")?;
     let path = args.next().ok_or("missing NEW_WAV path")?;
     let prepare = match args.next().as_deref() {
         None => false,
