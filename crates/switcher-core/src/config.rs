@@ -96,12 +96,27 @@ impl Default for SoundConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayoutConfig {
+    pub fallback_enabled: bool,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            fallback_enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub version: u32,
     pub badge: BadgeConfig,
     pub sound: SoundConfig,
+    pub layout: LayoutConfig,
     pub autostart: bool,
     pub log_level: String,
     pub ui_language: String,
@@ -113,6 +128,7 @@ impl Default for Config {
             version: CONFIG_VERSION,
             badge: BadgeConfig::default(),
             sound: SoundConfig::default(),
+            layout: LayoutConfig::default(),
             autostart: false,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
             ui_language: DEFAULT_UI_LANGUAGE.to_owned(),
@@ -246,9 +262,26 @@ mod tests {
         assert!(cfg.badge.colors.is_empty());
         assert!(cfg.sound.enabled);
         assert_eq!(cfg.sound.volume, 0.4);
+        assert!(cfg.layout.fallback_enabled);
         assert!(!cfg.autostart);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.ui_language, "ru");
+    }
+
+    #[test]
+    fn old_toml_without_layout_section_enables_fallback() {
+        let (cfg, warnings) =
+            Config::from_toml_str("version = 1\n[badge]\nshow_ms = 900\n").unwrap();
+        assert!(cfg.layout.fallback_enabled);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn explicit_false_disables_layout_fallback() {
+        let (cfg, warnings) =
+            Config::from_toml_str("[layout]\nfallback_enabled = false\n").unwrap();
+        assert!(!cfg.layout.fallback_enabled);
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -273,6 +306,7 @@ mod tests {
             .colors
             .insert("ru".to_owned(), "#112233".to_owned());
         cfg.sound.volume = 0.75;
+        cfg.layout.fallback_enabled = false;
         cfg.autostart = true;
         let (parsed, warnings) = Config::from_toml_str(&cfg.to_toml_string()).unwrap();
         assert_eq!(parsed, cfg);

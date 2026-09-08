@@ -150,6 +150,7 @@ impl Runtime {
             return;
         }
         self.initialized = true;
+        self.apply_layout_fallback(self.engine.config().layout.fallback_enabled);
         self.reconcile_autostart(now_ms);
         self.read_layout(LayoutSource::Initial, now_ms);
         self.sync_checks();
@@ -196,6 +197,8 @@ impl Runtime {
                     now_ms,
                 );
             }
+            // Opening our tray menu is an expected pause, not an adapter failure.
+            Err(error) if error.code == "foreground_is_own" => {}
             Err(error) => self.add_warning("layout_read_failed", error.to_string()),
         }
     }
@@ -207,6 +210,12 @@ impl Runtime {
                 lang,
                 source,
             } => {
+                if source == LayoutSource::ForegroundPoll
+                    && !self.engine.config().layout.fallback_enabled
+                {
+                    tracing::trace!("ignoring queued disabled layout fallback notification");
+                    return;
+                }
                 tracing::trace!(
                     ?layout,
                     lang = lang.as_str(),
@@ -255,6 +264,9 @@ impl Runtime {
                 } else {
                     BadgeMode::Follow
                 })
+            }
+            MenuCommand::ToggleLayoutFallback => {
+                Event::SetLayoutFallbackEnabled(!config.layout.fallback_enabled)
             }
             MenuCommand::ToggleSound => Event::SetSoundEnabled(!config.sound.enabled),
             MenuCommand::ToggleAutostart => Event::SetAutostart(!config.autostart),
@@ -373,6 +385,9 @@ impl Runtime {
                     }
                     self.publish_status();
                 }
+                Effect::SetLayoutFallbackEnabled(enabled) => {
+                    self.apply_layout_fallback(enabled);
+                }
                 Effect::ApplyAutostart(want) => {
                     let actual = match self.ports.autostart.set_enabled(want) {
                         Ok(()) => {
@@ -446,6 +461,13 @@ impl Runtime {
         }
     }
 
+    fn apply_layout_fallback(&mut self, enabled: bool) {
+        match self.ports.layout_monitor.set_fallback_enabled(enabled) {
+            Ok(()) => self.clear_warning("layout_fallback_update_failed"),
+            Err(error) => self.add_warning("layout_fallback_update_failed", error.to_string()),
+        }
+    }
+
     fn report_error(&mut self, capability: Capability, error: PlatformError) {
         self.report(CapabilityReport {
             capability,
@@ -498,6 +520,7 @@ impl Runtime {
         let config = self.engine.config();
         self.tray.send(TrayCommand::SyncChecks(Checks {
             follow: config.badge.mode == BadgeMode::Follow,
+            layout_fallback: config.layout.fallback_enabled,
             sound: config.sound.enabled,
             autostart: config.autostart,
         }));

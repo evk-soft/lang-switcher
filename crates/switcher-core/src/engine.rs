@@ -27,6 +27,7 @@ pub enum Event {
     HideTimerFired,
     SetMode(BadgeMode),
     SetSoundEnabled(bool),
+    SetLayoutFallbackEnabled(bool),
     SetAutostart(bool),
     /// The runtime's answer to `Effect::ApplyAutostart`, and the same path startup
     /// reconciliation uses: `Autostart::is_enabled()` is the OS truth, the config only
@@ -70,6 +71,7 @@ pub enum Effect {
         label: String,
         lang: LangTag,
     },
+    SetLayoutFallbackEnabled(bool),
     ApplyAutostart(bool),
     /// Config changed: runtime saves it and re-syncs tray checkmarks.
     PersistConfig,
@@ -141,6 +143,16 @@ impl Engine {
                 }
                 self.cfg.sound.enabled = enabled;
                 vec![Effect::PersistConfig]
+            }
+            Event::SetLayoutFallbackEnabled(enabled) => {
+                if self.cfg.layout.fallback_enabled == enabled {
+                    return vec![];
+                }
+                self.cfg.layout.fallback_enabled = enabled;
+                vec![
+                    Effect::SetLayoutFallbackEnabled(enabled),
+                    Effect::PersistConfig,
+                ]
             }
             // `cfg.autostart` mirrors a registry value, so the OS — not the click —
             // decides. No dedup on the request: the Run key may have drifted (a cleaner
@@ -672,6 +684,30 @@ mod tests {
         let mut e = engine_after_initial(); // sound.enabled == true by default
         assert_eq!(e.handle(Event::SetSoundEnabled(true), 1200), vec![]);
         assert!(e.config().sound.enabled);
+    }
+
+    #[test]
+    fn set_layout_fallback_updates_preference_requests_port_and_persists() {
+        let mut e = engine_after_initial();
+        let fx = e.handle(Event::SetLayoutFallbackEnabled(false), 1200);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::SetLayoutFallbackEnabled(false),
+                Effect::PersistConfig
+            ]
+        );
+        assert!(!e.config().layout.fallback_enabled);
+    }
+
+    #[test]
+    fn set_layout_fallback_same_value_is_a_noop() {
+        let mut e = engine_after_initial();
+        assert_eq!(
+            e.handle(Event::SetLayoutFallbackEnabled(true), 1200),
+            vec![]
+        );
+        assert!(e.config().layout.fallback_enabled);
     }
 
     // `cfg.autostart` mirrors a registry value, so every test below asserts the same

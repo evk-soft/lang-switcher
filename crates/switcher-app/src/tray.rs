@@ -3,6 +3,7 @@
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Checks {
     pub follow: bool,
+    pub layout_fallback: bool,
     pub sound: bool,
     pub autostart: bool,
 }
@@ -67,6 +68,13 @@ pub fn run_tray(
         init.checks.follow,
         None,
     );
+    let layout_fallback = CheckMenuItem::with_id(
+        ids::LAYOUT_FALLBACK,
+        "Резервная проверка раскладки",
+        true,
+        init.checks.layout_fallback,
+        None,
+    );
     let sound = CheckMenuItem::with_id(ids::SOUND, "Звук", true, init.checks.sound, None);
     let autostart = CheckMenuItem::with_id(
         ids::AUTOSTART,
@@ -89,6 +97,7 @@ pub fn run_tray(
     let quit = MenuItem::with_id(ids::QUIT, "Выход", true, None);
     let menu = Menu::with_items(&[
         &follow,
+        &layout_fallback,
         &sound,
         &autostart,
         &PredefinedMenuItem::separator(),
@@ -129,6 +138,7 @@ pub fn run_tray(
                 }
                 TrayCommand::SyncChecks(checks) => {
                     follow.set_checked(checks.follow);
+                    layout_fallback.set_checked(checks.layout_fallback);
                     sound.set_checked(checks.sound);
                     autostart.set_checked(checks.autostart);
                     Ok(())

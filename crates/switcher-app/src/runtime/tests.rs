@@ -18,6 +18,9 @@ enum Call {
 #[derive(Debug)]
 struct State {
     snapshot: Result<(LayoutId, LangTag), PlatformError>,
+    layout_reads: usize,
+    fallback_switches: Vec<bool>,
+    fallback_error: Option<PlatformError>,
     cursor: Option<Point>,
     dpi: u32,
     actual_autostart: Result<bool, PlatformError>,
@@ -29,7 +32,18 @@ struct State {
 struct Mock(Arc<Mutex<State>>);
 impl LayoutMonitor for Mock {
     fn current(&self) -> Result<(LayoutId, LangTag), PlatformError> {
-        self.0.lock().unwrap().snapshot.clone()
+        let mut state = self.0.lock().unwrap();
+        state.layout_reads += 1;
+        state.snapshot.clone()
+    }
+
+    fn set_fallback_enabled(&self, enabled: bool) -> Result<(), PlatformError> {
+        let mut state = self.0.lock().unwrap();
+        state.fallback_switches.push(enabled);
+        match &state.fallback_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 }
 impl PointerTracker for Mock {
@@ -85,6 +99,9 @@ impl Autostart for Mock {
 fn fixture(config: Config) -> (Runtime, Mock, Receiver<TrayCommand>, TempDir) {
     let mock = Mock(Arc::new(Mutex::new(State {
         snapshot: Ok((LayoutId(1), LangTag::new("ru-RU"))),
+        layout_reads: 0,
+        fallback_switches: vec![],
+        fallback_error: None,
         cursor: Some(Point { x: 10, y: 20 }),
         dpi: 144,
         actual_autostart: Ok(false),
@@ -125,12 +142,142 @@ fn notice() -> PlatformEvent {
     }
 }
 
+#[test]
+fn queued_layout_read_at_our_menu_keeps_the_badge_without_a_warning_or_sound() {
+    let (mut runtime, mock, _rx, _dir) = fixture(Config::default());
+    runtime.initialize(0);
+    mock.0.lock().unwrap().snapshot = Err(PlatformError::new("foreground_is_own", "own menu"));
+    runtime.handle_platform(
+        PlatformEvent::LayoutChanged {
+            layout: LayoutId(2),
+            lang: LangTag::new("en"),
+            source: LayoutSource::ForegroundPoll,
+        },
+        100,
+    );
+    assert_eq!(runtime.label, "RU");
+    assert!(calls(&mock).is_empty());
+    assert!(!runtime.warnings.contains_key("layout_read_failed"));
+    runtime.handle_platform(notice(), 101);
+    assert!(!runtime.warnings.contains_key("layout_read_failed"));
+}
+
 fn set_layout(mock: &Mock, id: u64, lang: &str) {
     mock.0.lock().unwrap().snapshot = Ok((LayoutId(id), LangTag::new(lang)));
 }
 
 fn calls(mock: &Mock) -> Vec<Call> {
     mock.0.lock().unwrap().calls.clone()
+}
+
+#[test]
+fn startup_applies_disabled_fallback_and_syncs_its_checkmark() {
+    let mut config = Config::default();
+    config.layout.fallback_enabled = false;
+    let (mut runtime, mock, rx, _dir) = fixture(config);
+    runtime.initialize(0);
+    assert_eq!(mock.0.lock().unwrap().fallback_switches, [false]);
+    assert!(rx.try_iter().any(|command| matches!(
+        command,
+        TrayCommand::SyncChecks(Checks {
+            layout_fallback: false,
+            ..
+        })
+    )));
+}
+
+#[test]
+fn layout_fallback_toggle_updates_port_checkmark_and_persisted_preference() {
+    let (mut runtime, mock, rx, dir) = fixture(Config::default());
+    runtime.initialize(0);
+    rx.try_iter().for_each(drop);
+
+    runtime.handle_menu(MenuCommand::ToggleLayoutFallback, 10);
+    assert!(!runtime.engine.config().layout.fallback_enabled);
+    assert!(
+        !ConfigStore::load(dir.0.join("config.toml"))
+            .config
+            .layout
+            .fallback_enabled
+    );
+    assert!(rx.try_iter().any(|command| matches!(
+        command,
+        TrayCommand::SyncChecks(Checks {
+            layout_fallback: false,
+            ..
+        })
+    )));
+
+    runtime.handle_menu(MenuCommand::ToggleLayoutFallback, 20);
+    assert!(runtime.engine.config().layout.fallback_enabled);
+    assert!(
+        ConfigStore::load(dir.0.join("config.toml"))
+            .config
+            .layout
+            .fallback_enabled
+    );
+    assert_eq!(
+        mock.0.lock().unwrap().fallback_switches,
+        [true, false, true]
+    );
+}
+
+#[test]
+fn fallback_port_error_keeps_and_persists_user_preference() {
+    let (mut runtime, mock, rx, dir) = fixture(Config::default());
+    runtime.initialize(0);
+    rx.try_iter().for_each(drop);
+    mock.0.lock().unwrap().fallback_error = Some(PlatformError::new(
+        "fallback_update_failed",
+        "worker disconnected",
+    ));
+
+    runtime.handle_menu(MenuCommand::ToggleLayoutFallback, 10);
+
+    assert!(!runtime.engine.config().layout.fallback_enabled);
+    assert!(
+        !ConfigStore::load(dir.0.join("config.toml"))
+            .config
+            .layout
+            .fallback_enabled
+    );
+    assert!(
+        runtime
+            .warnings
+            .contains_key("layout_fallback_update_failed")
+    );
+    assert!(rx.try_iter().any(|command| matches!(
+        command,
+        TrayCommand::SyncChecks(Checks {
+            layout_fallback: false,
+            ..
+        })
+    )));
+}
+
+#[test]
+fn disabled_fallback_ignores_queued_poll_but_keeps_other_layout_sources() {
+    let mut config = Config::default();
+    config.layout.fallback_enabled = false;
+    let (mut runtime, mock, _rx, _dir) = fixture(config);
+    runtime.initialize(0);
+    assert_eq!(mock.0.lock().unwrap().layout_reads, 1);
+    set_layout(&mock, 2, "en-US");
+
+    runtime.handle_platform(
+        PlatformEvent::LayoutChanged {
+            layout: LayoutId(2),
+            lang: LangTag::new("en-US"),
+            source: LayoutSource::ForegroundPoll,
+        },
+        10,
+    );
+    assert_eq!(runtime.label, "RU");
+    assert_eq!(mock.0.lock().unwrap().layout_reads, 1);
+
+    runtime.handle_platform(notice(), 20);
+    assert_eq!(runtime.label, "EN");
+    assert_eq!(mock.0.lock().unwrap().layout_reads, 2);
 }
 
 #[test]

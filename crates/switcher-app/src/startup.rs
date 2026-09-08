@@ -30,7 +30,7 @@ use switcher_windows::{
 pub struct Options {
     /// Explicit data directory for portable diagnostics; normal launches use AppData.
     pub data_dir: Option<PathBuf>,
-    /// Optional bounded diagnostic run. No periodic timer is created otherwise.
+    /// Optional one-shot diagnostic shutdown, independent of layout polling.
     pub run_for: Option<Duration>,
 }
 
@@ -166,7 +166,10 @@ pub fn run(options: Options) -> anyhow::Result<()> {
             Box::new(NullPointer)
         }
     };
-    let layout_monitor: Box<dyn LayoutMonitor> = match LayoutHooks::new(events_tx.clone()) {
+    let layout_monitor: Box<dyn LayoutMonitor> = match LayoutHooks::with_fallback(
+        events_tx.clone(),
+        loaded.config.layout.fallback_enabled,
+    ) {
         Ok(monitor) => Box::new(monitor),
         Err(error) => {
             unavailable(&mut caps, Capability::LayoutShellHook, error.clone());
@@ -202,6 +205,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         status: compose_status(&caps),
         checks: Checks {
             follow: loaded.config.badge.mode == switcher_core::config::BadgeMode::Follow,
+            layout_fallback: loaded.config.layout.fallback_enabled,
             sound: loaded.config.sound.enabled,
             autostart: loaded.config.autostart,
         },
