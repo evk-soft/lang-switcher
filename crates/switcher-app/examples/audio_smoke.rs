@@ -24,13 +24,22 @@ fn main() -> anyhow::Result<()> {
         let before = device.stats().completed;
         let began = Instant::now();
         if audible {
+            println!(
+                "LISTEN {}/20: {}",
+                index + 1,
+                if index % 2 == 0 {
+                    "RU (lower tone)"
+                } else {
+                    "EN (higher tone)"
+                }
+            );
             player.play(
                 if index % 2 == 0 {
                     SoundCue::Ru
                 } else {
                     SoundCue::En
                 },
-                0.08,
+                0.4,
             );
         } else {
             pcm.play(vec![0; 3969]);
@@ -53,6 +62,11 @@ fn main() -> anyhow::Result<()> {
             began.elapsed().as_millis(),
             device.stats()
         );
+        if audible {
+            // Listening is a separate diagnostic mode, not a latency benchmark.
+            // Leave enough silence to distinguish two adjacent 90ms cues by ear.
+            std::thread::sleep(Duration::from_millis(900));
+        }
     }
     std::thread::sleep(Duration::from_secs(2));
     assert!(!device.stats().active);

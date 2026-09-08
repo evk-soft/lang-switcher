@@ -1,9 +1,12 @@
 //! Native observation harness. Enter schedules a snapshot in 3 seconds; q exits. A numeric argument
 //! limits the observation to that many seconds, for unattended registration checks.
+//! With a duration, --sample adds 100ms diagnostic snapshots and --stop-file PATH
+//! ends the observation early when its controller creates that file.
 //! It does not switch layouts or change the foreground window.
 
 use std::cell::Cell;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use switcher_platform::events::Capability;
 use switcher_platform::ports::PlatformError;
 use switcher_windows::supervise::{callback_panic_outcome, guard_callback};
@@ -14,9 +17,9 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DeregisterShellHookWindow, EVENT_SYSTEM_FOREGROUND, GetClassNameW,
-    GetForegroundWindow, GetWindowThreadProcessId, RegisterShellHookWindow, RegisterWindowMessageW,
-    WINEVENT_OUTOFCONTEXT,
+    DefWindowProcW, DeregisterShellHookWindow, EVENT_SYSTEM_FOREGROUND, GUITHREADINFO,
+    GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
+    RegisterShellHookWindow, RegisterWindowMessageW, WINEVENT_OUTOFCONTEXT,
 };
 use windows::core::w;
 
@@ -50,8 +53,54 @@ fn snapshot(reason: &str) {
     // a subsequent foreground change may make it stale and is logged separately.
     let hkl = unsafe { GetKeyboardLayout(tid) };
     let class = String::from_utf16_lossy(&class[..length.max(0) as usize]);
+    let mut gui = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: initialized structure with the required cbSize. Zero asks for the
+    // foreground input queue; querying a foreign thread is explicitly supported.
+    let focus_info = unsafe { GetGUIThreadInfo(0, &mut gui) };
+    let mut focus_pid = 0;
+    let mut focus_class = [0u16; 256];
+    let (focus_tid, focus_length) = if focus_info.is_ok() && !gui.hwndFocus.is_invalid() {
+        // SAFETY: borrowed HWND, initialized output buffers. A vanished window may
+        // return zero, which is never passed to GetKeyboardLayout below.
+        unsafe {
+            (
+                GetWindowThreadProcessId(gui.hwndFocus, Some(&mut focus_pid)),
+                GetClassNameW(gui.hwndFocus, &mut focus_class),
+            )
+        }
+    } else {
+        (0, 0)
+    };
+    let focus_hkl = if focus_tid != 0 {
+        // SAFETY: nonzero observed TID. No layout handle is owned or dereferenced.
+        Some(unsafe { GetKeyboardLayout(focus_tid) })
+    } else {
+        None
+    };
+    let mut after = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: repeated read-only identity checks, initialized output. Focus can
+    // change between children without changing the top-level foreground HWND.
+    let stable = unsafe {
+        GetGUIThreadInfo(0, &mut after).is_ok()
+            && GetForegroundWindow() == hwnd
+            && GetWindowThreadProcessId(hwnd, None) == tid
+            && focus_info.is_ok()
+            && focus_tid != 0
+            && after.hwndFocus == gui.hwndFocus
+            && GetWindowThreadProcessId(after.hwndFocus, None) == focus_tid
+    };
     tracing::info!(reason, hwnd = ?hwnd, tid, pid, class, hkl = ?hkl,
-        langid = hkl.0 as usize & 0xffff, reader_thread = current_thread_id(), "foreground snapshot");
+        langid = hkl.0 as usize & 0xffff, reader_thread = current_thread_id(),
+        focus_hwnd = ?gui.hwndFocus, focus_tid, focus_pid,
+        focus_class = String::from_utf16_lossy(&focus_class[..focus_length.max(0) as usize]).as_str(),
+        ?focus_hkl, focus_error = ?focus_info.err(), stable,
+        "foreground snapshot");
 }
 
 struct Probe {
@@ -134,6 +183,24 @@ unsafe extern "system" fn foreground_proc(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let seconds = args.next().map(|value| value.parse::<u64>()).transpose()?;
+    if seconds.is_some_and(|value| !(1..=3600).contains(&value)) {
+        return Err("duration must be 1..=3600 seconds".into());
+    }
+    let mut sample = false;
+    let mut stop_file = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--sample" => sample = true,
+            "--stop-file" => {
+                stop_file = Some(PathBuf::from(
+                    args.next().ok_or("--stop-file needs a path")?,
+                ));
+            }
+            _ => return Err("usage: layout_probe [seconds [--sample] [--stop-file PATH]]".into()),
+        }
+    }
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
@@ -176,12 +243,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     })?;
     snapshot("startup");
-    if let Some(seconds) = std::env::args()
-        .nth(1)
-        .and_then(|arg| arg.parse::<u64>().ok())
-    {
+    if let Some(seconds) = seconds {
         // This bounded observation wait belongs only to the experiment, not an adapter.
-        std::thread::sleep(Duration::from_secs(seconds));
+        if sample || stop_file.is_some() {
+            let deadline = Instant::now() + Duration::from_secs(seconds);
+            while Instant::now() < deadline {
+                if stop_file.as_ref().is_some_and(|path| path.exists()) {
+                    break;
+                }
+                if sample {
+                    snapshot("sample");
+                }
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(100)),
+                );
+            }
+        } else {
+            std::thread::sleep(Duration::from_secs(seconds));
+        }
     } else {
         tracing::info!(
             "open/close an ordinary app for a positive shell control, switch layouts 10 times, then Enter for a snapshot; q exits"
