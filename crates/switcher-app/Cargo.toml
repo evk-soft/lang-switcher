@@ -22,7 +22,6 @@ tracing-appender = { workspace = true }
 directories = { workspace = true }
 tiny-skia = { workspace = true }
 ab_glyph = { workspace = true }
-rodio = { workspace = true }
 
 # The tray exists only on Windows in M1, and `muda` comes with it as `tray_icon::menu`
 # rather than as a second path to the same types (ADR-0008).

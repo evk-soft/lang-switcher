@@ -1,103 +1,27 @@
-//! Synthesized cues. The output device is owned by the main thread (ADR-0009).
+//! Pure PCM cue synthesis and a demand-driven Windows player (ADR-0016).
 
-use std::{
-    marker::PhantomData,
-    rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use switcher_platform::ports::{SoundCue, SoundPlayer};
 
-use crossbeam_channel::Sender;
-use rodio::{DeviceSinkBuilder, Source, source::SineWave};
-use switcher_platform::{
-    events::{Capability, CapabilityReport, CapabilityState, PlatformEvent},
-    ports::{SoundCue, SoundPlayer},
-};
+#[cfg(windows)]
+pub use switcher_windows::audio::PcmDevice as SoundDevice;
 
-/// Construct and drop on the main, message-pumping thread: cpal initializes COM STA.
+#[cfg(windows)]
 #[derive(Debug)]
-pub struct SoundDevice {
-    _sink: rodio::MixerDeviceSink,
-    available: Arc<AtomicBool>,
-    _main_thread: PhantomData<Rc<()>>,
-}
+pub struct WasapiSoundPlayer(pub switcher_windows::audio::PcmSender);
 
-pub struct RodioSoundPlayer {
-    mixer: rodio::mixer::Mixer,
-    available: Arc<AtomicBool>,
-}
-
-impl std::fmt::Debug for RodioSoundPlayer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RodioSoundPlayer")
-            .field("available", &self.available.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
-}
-
-impl SoundDevice {
-    /// The caller reports startup success/failure. Later stream failure reports Off
-    /// once and stops accepting tones, without changing the user's sound preference.
-    pub fn open(
-        tx: Sender<PlatformEvent>,
-    ) -> Result<(Self, RodioSoundPlayer), rodio::DeviceSinkError> {
-        let available = Arc::new(AtomicBool::new(true));
-        let on_error = Arc::clone(&available);
-        // Keep output on the selected default device; try its supported formats.
-        // The stock open_default_sink helper has no custom error callback.
-        let mut sink = DeviceSinkBuilder::from_default_device()?
-            .with_error_callback(move |error| {
-                if on_error.swap(false, Ordering::AcqRel) {
-                    let _ = tx.send(PlatformEvent::CapabilityChanged(CapabilityReport {
-                        capability: Capability::Sound,
-                        state: CapabilityState::Off,
-                        code: "audio_stream_failed",
-                        detail: error.to_string(),
-                    }));
-                }
-            })
-            .open_sink_or_fallback()?;
-        sink.log_on_drop(false);
-        let player = RodioSoundPlayer {
-            mixer: sink.mixer().clone(),
-            available: Arc::clone(&available),
-        };
-        Ok((
-            Self {
-                _sink: sink,
-                available,
-                _main_thread: PhantomData,
-            },
-            player,
-        ))
-    }
-}
-
-impl Drop for SoundDevice {
-    fn drop(&mut self) {
-        self.available.store(false, Ordering::Release);
-    }
-}
-
-impl SoundPlayer for RodioSoundPlayer {
+#[cfg(windows)]
+impl SoundPlayer for WasapiSoundPlayer {
     fn play(&self, cue: SoundCue, volume: f32) {
-        if !self.available.load(Ordering::Acquire) {
-            return;
-        }
-        if let Some(gain) = effective_gain(volume) {
-            self.mixer.add(tone(cue, gain));
+        if let Some(samples) = pcm_tone(cue, volume) {
+            self.0.play(samples);
         }
     }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NullSoundPlayer;
-
 impl SoundPlayer for NullSoundPlayer {
-    fn play(&self, _cue: SoundCue, _volume: f32) {}
+    fn play(&self, _: SoundCue, _: f32) {}
 }
 
 fn cue_freq_hz(cue: SoundCue) -> f32 {
@@ -112,18 +36,43 @@ fn effective_gain(volume: f32) -> Option<f32> {
     (volume.is_finite() && volume > 0.0).then(|| volume.min(1.0))
 }
 
-fn tone(cue: SoundCue, gain: f32) -> impl Source<Item = f32> + Send + 'static {
-    let duration = Duration::from_millis(90);
-    // rodio's fade_out begins at source start, so use the entire tone duration.
-    SineWave::new(cue_freq_hz(cue))
-        .take_duration(duration)
-        .fade_out(duration)
-        .amplify(gain)
+/// 90ms mono PCM16 at 44100Hz; volume is part of the samples, never global device state.
+pub fn pcm_tone(cue: SoundCue, volume: f32) -> Option<Vec<i16>> {
+    let gain = effective_gain(volume)?;
+    let length = 3969;
+    let attack = 220.0; // Five milliseconds, avoiding an abrupt onset.
+    Some(
+        (0..length)
+            .map(|i| {
+                let phase = std::f32::consts::TAU * cue_freq_hz(cue) * i as f32 / 44100.0;
+                let envelope =
+                    (i as f32 / attack).min(1.0) * (length - 1 - i) as f32 / (length - 1) as f32;
+                (phase.sin() * envelope * gain * i16::MAX as f32).round() as i16
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pcm_has_exact_duration_silent_edges_and_distinct_frequencies() {
+        let ru = pcm_tone(SoundCue::Ru, 0.4).unwrap();
+        let en = pcm_tone(SoundCue::En, 0.4).unwrap();
+        assert_eq!(ru.len(), 3969);
+        assert_eq!(ru[0], 0);
+        assert_eq!(*ru.last().unwrap(), 0);
+        assert!(ru.iter().any(|v| v.abs() > 8000));
+        assert!(ru.iter().all(|v| v.abs() <= 13107));
+        let crossings =
+            |samples: &[i16]| samples.windows(2).filter(|w| w[0] < 0 && w[1] >= 0).count();
+        assert!((58..=60).contains(&crossings(&ru)));
+        assert!((78..=80).contains(&crossings(&en)));
+        assert!(pcm_tone(SoundCue::Ru, 0.0).is_none());
+        assert!(pcm_tone(SoundCue::Ru, f32::NAN).is_none());
+    }
 
     #[test]
     fn cues_have_distinct_audible_frequencies() {
@@ -150,7 +99,11 @@ mod tests {
 
     #[test]
     fn tone_has_a_finite_duration_and_fades_to_silence() {
-        let samples: Vec<_> = tone(SoundCue::Ru, 0.4).collect();
+        let samples: Vec<f32> = pcm_tone(SoundCue::Ru, 0.4)
+            .unwrap()
+            .into_iter()
+            .map(|v| v as f32 / i16::MAX as f32)
+            .collect();
         assert!((3500..5000).contains(&samples.len()));
         assert!(samples.iter().all(|v| v.is_finite() && v.abs() <= 0.4));
         let peak = |part: &[f32]| part.iter().map(|v| v.abs()).fold(0.0, f32::max);
