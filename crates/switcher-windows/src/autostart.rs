@@ -131,9 +131,14 @@ impl Autostart for RegistryAutostart {
                         )
                     };
                     if read == ERROR_SUCCESS && kind == REG_SZ {
+                        // `as_chunks` rather than `chunks_exact(2)`: the pair is a
+                        // fixed-size array, so the element accesses below need no bounds
+                        // checks. A trailing odd byte is discarded either way.
                         let units: Vec<u16> = bytes[..size as usize]
-                            .chunks_exact(2)
-                            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|b| u16::from_le_bytes(*b))
                             .take_while(|&c| c != 0)
                             .collect();
                         tracing::debug!(
@@ -207,8 +212,10 @@ mod tests {
     fn run_value_is_quoted_utf16le_with_terminator() {
         let bytes = run_value_bytes(Path::new(r"C:\Program Files\ls\lang-switcher.exe")).unwrap();
         let text: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
             .collect();
         assert_eq!(
             String::from_utf16(&text[..text.len() - 1]).unwrap(),
