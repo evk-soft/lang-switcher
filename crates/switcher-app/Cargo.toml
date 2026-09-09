@@ -1,0 +1,40 @@
+[package]
+name = "switcher-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lang-switcher"
+path = "src/main.rs"
+
+[dependencies]
+switcher-core = { workspace = true }
+switcher-platform = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+directories = { workspace = true }
+fluent-bundle = { workspace = true }
+unic-langid = { workspace = true }
+tiny-skia = { workspace = true }
+ab_glyph = { workspace = true }
+
+# The tray exists only on Windows in M1, and `muda` comes with it as `tray_icon::menu`
+# rather than as a second path to the same types (ADR-0008).
+[target.'cfg(windows)'.dependencies]
+switcher-windows = { workspace = true }
+tray-icon = { workspace = true }
+
+[lints]
+workspace = true
+
+# Build-time only: compiles the VERSIONINFO and icon resource. It never becomes part of
+# the shipped binary's dependency tree, so ADR-0008's runtime trimming does not apply.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"

@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# No dependency caching yet: a cold build of this workspace is ~1-2 min and staying
+# free of third-party actions keeps the supply chain to actions/checkout alone.
+jobs:
+  gates:
+    # The three gates from CLAUDE.md rule 1 / skill quality-gates, on the primary target OS.
+    name: Gates (Windows, stable)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal -c rustfmt -c clippy
+          rustup default stable
+          rustc -V && cargo -V
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  core-portability:
+    # CLAUDE.md rule 4: switcher-core compiles and is fully tested on any OS. Only the two
+    # OS-free crates are built here on purpose — switcher-app pulls tray-icon/muda/rodio,
+    # which need GTK and ALSA system packages on Linux and are not part of that guarantee.
+    name: Core portability (Linux, stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal -c clippy
+          rustup default stable
+          rustc -V
+      - name: cargo clippy -D warnings (core + platform)
+        run: cargo clippy -p switcher-core -p switcher-platform --all-targets --locked -- -D warnings
+      - name: cargo test (core + platform)
+        run: cargo test -p switcher-core -p switcher-platform --locked
+
+  msrv:
+    # Guards workspace.package.rust-version. Verified green locally on 1.88.0 before this
+    # job was added, so a red run here means a dependency bump raised the real MSRV.
+    name: MSRV (1.88.0, Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+          rustc -V
+      - name: cargo check on MSRV
+        run: cargo check --workspace --all-targets --locked
+
+  package:
+    # Builds the real release artifacts on every pull request, then installs, runs and
+    # uninstalls them. Packaging that is only exercised at tag time is packaging that
+    # breaks at tag time.
+    name: Package (Windows, installer smoke)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc -V
+      - name: Build artifacts
+        shell: pwsh
+        run: pwsh -File packaging/build-release.ps1
+      - name: Installer installs, the binary runs, uninstall cleans up
+        shell: pwsh
+        run: pwsh -File packaging/verify-install.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lang-switcher-windows-x64
+          path: |
+            target/packaging/*.exe
+            target/packaging/*.zip
+            target/packaging/SHA256SUMS.txt
+            target/packaging/THIRD-PARTY-LICENSES.md
+          if-no-files-found: error
+          retention-days: 14
