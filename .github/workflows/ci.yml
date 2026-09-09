@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -49,16 +52,46 @@ jobs:
         run: cargo test -p switcher-core -p switcher-platform --locked
 
   msrv:
-    # Guards workspace.package.rust-version. Verified green locally on 1.87.0 before this
+    # Guards workspace.package.rust-version. Verified green locally on 1.88.0 before this
     # job was added, so a red run here means a dependency bump raised the real MSRV.
-    name: MSRV (1.87.0, Windows)
+    name: MSRV (1.88.0, Windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
         run: |
-          rustup toolchain install 1.87.0 --profile minimal
-          rustup default 1.87.0
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
           rustc -V
       - name: cargo check on MSRV
         run: cargo check --workspace --all-targets --locked
+
+  package:
+    # Builds the real release artifacts on every pull request, then installs, runs and
+    # uninstalls them. Packaging that is only exercised at tag time is packaging that
+    # breaks at tag time.
+    name: Package (Windows, installer smoke)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc -V
+      - name: Build artifacts
+        shell: pwsh
+        run: pwsh -File packaging/build-release.ps1
+      - name: Installer installs, the binary runs, uninstall cleans up
+        shell: pwsh
+        run: pwsh -File packaging/verify-install.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lang-switcher-windows-x64
+          path: |
+            target/packaging/*.exe
+            target/packaging/*.zip
+            target/packaging/SHA256SUMS.txt
+            target/packaging/THIRD-PARTY-LICENSES.md
+          if-no-files-found: error
+          retention-days: 14

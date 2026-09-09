@@ -1,0 +1,104 @@
+name: Release
+
+# Tag-driven, and it stops at a draft on purpose: an unsigned alpha has to be downloaded
+# and installed by a person before anyone else is offered it. Publishing is a deliberate
+# click, not a side effect of pushing a tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, e.g. 0.1.0-alpha.1 (must match Cargo.toml)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build, verify and draft the release
+    runs-on: windows-latest
+    permissions:
+      # Only this job creates the draft release; nothing else in the workflow needs write.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal -c rustfmt -c clippy
+          rustup default stable
+          rustc -V && cargo -V
+
+      - name: Resolve and cross-check the version
+        id: version
+        shell: pwsh
+        run: |
+          $manifest = Get-Content Cargo.toml -Raw
+          if ($manifest -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+            throw 'could not read workspace.package.version'
+          }
+          $cargo = $Matches[1]
+          $asked = if ('${{ github.event_name }}' -eq 'push') {
+            '${{ github.ref_name }}' -replace '^v', ''
+          } else {
+            '${{ inputs.version }}'
+          }
+          if ($cargo -ne $asked) {
+            throw "tag or input says '$asked' but Cargo.toml says '$cargo'"
+          }
+          "version=$cargo" >> $env:GITHUB_OUTPUT
+          "tag=v$cargo" >> $env:GITHUB_OUTPUT
+          Write-Host "Releasing $cargo"
+
+      # The same gates a pull request runs. A tag must never ship what a branch could not.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Build artifacts
+        shell: pwsh
+        run: pwsh -File packaging/build-release.ps1 -Version '${{ steps.version.outputs.version }}'
+
+      - name: Installer installs, the binary runs, uninstall cleans up
+        shell: pwsh
+        run: pwsh -File packaging/verify-install.ps1
+
+      - name: Create the draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $tag = '${{ steps.version.outputs.tag }}'
+          # A version with a pre-release suffix is a prerelease; nothing else decides it.
+          $prerelease = if ($version -match '-') { '--prerelease' } else { '' }
+          $notes = "target/packaging/release-notes.md"
+          pwsh -File packaging/release-notes.ps1 -Version $version -Output $notes
+          $assets = @(
+            "target/packaging/lang-switcher-$version-windows-x64-setup.exe",
+            "target/packaging/lang-switcher-$version-windows-x64-portable.zip",
+            "target/packaging/SHA256SUMS.txt",
+            "target/packaging/THIRD-PARTY-LICENSES.md"
+          )
+          foreach ($asset in $assets) {
+            if (-not (Test-Path $asset)) { throw "missing release asset: $asset" }
+          }
+          $arguments = @(
+            'release', 'create', $tag,
+            '--draft',
+            '--title', "lang-switcher $version",
+            '--notes-file', $notes,
+            '--target', '${{ github.sha }}'
+          )
+          if ($prerelease) { $arguments += $prerelease }
+          gh @arguments @assets
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed with $LASTEXITCODE" }
+          Write-Host "Draft release $tag created. Download, verify, then publish it."

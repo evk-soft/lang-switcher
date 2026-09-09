@@ -25,6 +25,8 @@ struct State {
     dpi: u32,
     actual_autostart: Result<bool, PlatformError>,
     write_error: Option<PlatformError>,
+    ui_languages: Result<Vec<String>, PlatformError>,
+    ui_language_reads: usize,
     calls: Vec<Call>,
 }
 
@@ -82,6 +84,13 @@ impl SoundPlayer for Mock {
         self.0.lock().unwrap().calls.push(Call::Sound);
     }
 }
+impl UiLanguages for Mock {
+    fn preferred(&self) -> Result<Vec<String>, PlatformError> {
+        let mut state = self.0.lock().unwrap();
+        state.ui_language_reads += 1;
+        state.ui_languages.clone()
+    }
+}
 impl Autostart for Mock {
     fn is_enabled(&self) -> Result<bool, PlatformError> {
         self.0.lock().unwrap().actual_autostart.clone()
@@ -106,6 +115,8 @@ fn fixture(config: Config) -> (Runtime, Mock, Receiver<TrayCommand>, TempDir) {
         dpi: 144,
         actual_autostart: Ok(false),
         write_error: None,
+        ui_languages: Ok(vec!["de-DE".to_owned()]),
+        ui_language_reads: 0,
         calls: vec![],
     })));
     let ports = Ports {
@@ -115,10 +126,12 @@ fn fixture(config: Config) -> (Runtime, Mock, Receiver<TrayCommand>, TempDir) {
         caret: Box::new(mock.clone()),
         sound: Box::new(mock.clone()),
         autostart: Box::new(mock.clone()),
+        ui_languages: Box::new(mock.clone()),
     };
     let dir = TempDir::new();
     let loaded = ConfigStore::load(dir.0.join("config.toml"));
     let (tx, rx) = crossbeam_channel::unbounded();
+    let translator = Translator::for_config(&config.ui_language, &[]);
     (
         Runtime::new(
             config,
@@ -127,6 +140,7 @@ fn fixture(config: Config) -> (Runtime, Mock, Receiver<TrayCommand>, TempDir) {
             loaded.store,
             TraySender::new(tx),
             CapabilityMap::default(),
+            translator,
         ),
         mock,
         rx,
@@ -168,6 +182,200 @@ fn set_layout(mock: &Mock, id: u64, lang: &str) {
 
 fn calls(mock: &Mock) -> Vec<Call> {
     mock.0.lock().unwrap().calls.clone()
+}
+
+fn tooltip_texts(rx: &Receiver<TrayCommand>) -> Vec<String> {
+    rx.try_iter()
+        .filter_map(|command| match command {
+            TrayCommand::SetTooltip(text) => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn choosing_a_language_relabels_the_tray_and_survives_a_restart() {
+    let (mut runtime, mock, rx, dir) = fixture(Config::default());
+    runtime.initialize(0);
+    rx.try_iter().for_each(drop);
+
+    runtime.handle_menu(MenuCommand::SetUiLanguage("ru".into()), 10);
+
+    assert_eq!(runtime.engine.config().ui_language, "ru");
+    assert_eq!(runtime.tr.locale().tag, "ru");
+    let commands: Vec<TrayCommand> = rx.try_iter().collect();
+    let relabelled = commands.iter().find_map(|command| match command {
+        TrayCommand::Localize(labels) => Some(labels.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        relabelled.expect("the tray is relabelled").quit,
+        "Выход",
+        "the menu must be redrawn in the chosen language"
+    );
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        TrayCommand::SyncChecks(Checks { ui_language, .. }) if ui_language == "ru"
+    )));
+    assert!(
+        commands
+            .iter()
+            .any(|command| matches!(command, TrayCommand::SetTooltip(_))),
+        "the tooltip is user-visible text and must be redrawn too"
+    );
+
+    // Nothing about a menu language is an input event.
+    assert!(!calls(&mock).contains(&Call::Sound));
+    assert!(
+        !calls(&mock)
+            .iter()
+            .any(|call| matches!(call, Call::Show(..))),
+        "picking a language must not pop up a badge"
+    );
+
+    assert_eq!(
+        ConfigStore::load(dir.0.join("config.toml"))
+            .config
+            .ui_language,
+        "ru",
+        "the choice must outlive the process"
+    );
+}
+
+/// The menu library unticks a check item itself before it hands us the click, so a click
+/// on the already-selected language must still produce a `SyncChecks`. Without one the
+/// language submenu would sit with nothing ticked, indefinitely, while the config is
+/// unchanged — it is the only place the active interface language is shown.
+#[test]
+fn re_selecting_the_current_language_still_re_asserts_the_check_marks() {
+    let (mut runtime, _mock, rx, dir) = fixture(Config::default());
+    runtime.initialize(0);
+    rx.try_iter().for_each(drop);
+    assert_eq!(runtime.engine.config().ui_language, "auto");
+
+    runtime.handle_menu(MenuCommand::SetUiLanguage("auto".into()), 10);
+
+    let commands: Vec<TrayCommand> = rx.try_iter().collect();
+    assert!(
+        commands.iter().any(|command| matches!(
+            command,
+            TrayCommand::SyncChecks(Checks { ui_language, .. }) if ui_language == "auto"
+        )),
+        "the menu must be re-synced even though nothing changed: {commands:?}"
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|command| matches!(command, TrayCommand::Localize(_))),
+        "nothing changed, so there is nothing to relabel"
+    );
+    assert!(
+        !dir.0.join("config.toml").exists(),
+        "a no-op click must not write the config file"
+    );
+
+    // The same must hold for an explicitly chosen language, not just the default.
+    runtime.handle_menu(MenuCommand::SetUiLanguage("de".into()), 20);
+    rx.try_iter().for_each(drop);
+    runtime.handle_menu(MenuCommand::SetUiLanguage("de".into()), 30);
+    assert!(rx.try_iter().any(|command| matches!(
+        command,
+        TrayCommand::SyncChecks(Checks { ui_language, .. }) if ui_language == "de"
+    )));
+    assert_eq!(runtime.tr.locale().tag, "de");
+}
+
+/// "auto" is the only value that consults the OS, and it must not be consulted on any
+/// other path — a layout switch must never turn into a display-language query.
+#[test]
+fn auto_reads_the_system_preference_and_an_explicit_choice_does_not() {
+    let (mut runtime, mock, rx, _dir) = fixture(Config::default());
+    runtime.initialize(0);
+    rx.try_iter().for_each(drop);
+    let reads_after_startup = mock.0.lock().unwrap().ui_language_reads;
+
+    set_layout(&mock, 2, "en-US");
+    runtime.handle_platform(notice(), 10);
+    assert_eq!(
+        mock.0.lock().unwrap().ui_language_reads,
+        reads_after_startup,
+        "a layout change must not query the display language"
+    );
+
+    runtime.handle_menu(MenuCommand::SetUiLanguage("fr".into()), 20);
+    assert_eq!(runtime.tr.locale().tag, "fr");
+    assert_eq!(
+        mock.0.lock().unwrap().ui_language_reads,
+        reads_after_startup,
+        "an explicit language must not query the OS"
+    );
+
+    runtime.handle_menu(MenuCommand::SetUiLanguage("auto".into()), 30);
+    assert_eq!(
+        mock.0.lock().unwrap().ui_language_reads,
+        reads_after_startup + 1
+    );
+    assert_eq!(
+        runtime.tr.locale().tag,
+        "de",
+        "the mock reports de-DE as the display language"
+    );
+}
+
+/// The port is allowed to fail. English is a working menu; an empty one is not.
+#[test]
+fn a_failing_display_language_query_falls_back_to_english() {
+    let (mut runtime, mock, rx, _dir) = fixture(Config::default());
+    runtime.initialize(0);
+    mock.0.lock().unwrap().ui_languages = Err(PlatformError::new("test_failure", "no answer"));
+    rx.try_iter().for_each(drop);
+
+    runtime.handle_menu(MenuCommand::SetUiLanguage("ru".into()), 10);
+    runtime.handle_menu(MenuCommand::SetUiLanguage("auto".into()), 20);
+
+    assert_eq!(runtime.tr.locale().tag, "en");
+    assert_eq!(runtime.engine.config().ui_language, "auto");
+    assert!(
+        runtime.warnings.is_empty(),
+        "a display-language read is not a capability failure (ADR-0022)"
+    );
+}
+
+#[test]
+fn the_tooltip_follows_the_chosen_language() {
+    let (mut runtime, mock, rx, _dir) = fixture(Config::default());
+    runtime.initialize(0);
+    set_layout(&mock, 2, "ru-RU");
+    runtime.handle_platform(notice(), 10);
+    rx.try_iter().for_each(drop);
+
+    runtime.handle_menu(MenuCommand::SetUiLanguage("ru".into()), 20);
+    let russian = tooltip_texts(&rx);
+    assert!(
+        russian.iter().any(|text| text.contains("RU")),
+        "the badge label stays in the tooltip: {russian:?}"
+    );
+
+    // Degrade something so the tooltip has a translated word in it, not just the label.
+    runtime.handle_platform(
+        PlatformEvent::CapabilityChanged(CapabilityReport {
+            capability: Capability::Sound,
+            state: CapabilityState::Off,
+            code: "test_failure",
+            detail: "Unavailable".into(),
+        }),
+        30,
+    );
+    assert!(
+        tooltip_texts(&rx).iter().any(|text| text.contains("звук")),
+        "the warning line must be in the chosen language"
+    );
+
+    runtime.handle_menu(MenuCommand::SetUiLanguage("de".into()), 40);
+    assert!(
+        tooltip_texts(&rx).iter().any(|text| text.contains("Ton")),
+        "switching language must redraw the warning line"
+    );
 }
 
 #[test]

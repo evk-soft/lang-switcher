@@ -3,9 +3,10 @@
 use crate::{
     capability::{CapabilityMap, compose_status, compose_tooltip},
     config_io::ConfigStore,
+    i18n::Translator,
     menu::MenuCommand,
     render::BadgeCache,
-    tray::{Checks, TrayCommand},
+    tray::{Checks, TrayCommand, TrayLabels},
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::{
@@ -31,6 +32,8 @@ pub struct Ports {
     pub caret: Box<dyn CaretLocator>,
     pub sound: Box<dyn SoundPlayer>,
     pub autostart: Box<dyn Autostart>,
+    /// Read only while `ui_language` is "auto" (ADR-0022); never on a layout event.
+    pub ui_languages: Box<dyn UiLanguages>,
 }
 
 impl std::fmt::Debug for Ports {
@@ -70,18 +73,17 @@ impl TraySender {
             return;
         }
         #[cfg(windows)]
-        if shutting_down {
-            if let Some(quit) = &self.quit {
-                if let Err(error) = quit.request() {
-                    tracing::warn!(%error, "could not request native tray shutdown");
-                }
-            }
+        if shutting_down
+            && let Some(quit) = &self.quit
+            && let Err(error) = quit.request()
+        {
+            tracing::warn!(%error, "could not request native tray shutdown");
         }
         #[cfg(windows)]
-        if let Some(waker) = &self.waker {
-            if let Err(error) = waker.wake() {
-                tracing::warn!(%error, "could not wake tray");
-            }
+        if let Some(waker) = &self.waker
+            && let Err(error) = waker.wake()
+        {
+            tracing::warn!(%error, "could not wake tray");
         }
     }
 
@@ -107,6 +109,7 @@ pub struct Runtime {
     store: ConfigStore,
     tray: TraySender,
     caps: CapabilityMap,
+    tr: Translator,
     warnings: BTreeMap<&'static str, String>,
     label: String,
     last: Option<Shown>,
@@ -125,6 +128,7 @@ impl Runtime {
         store: ConfigStore,
         tray: TraySender,
         caps: CapabilityMap,
+        tr: Translator,
     ) -> Self {
         Self {
             engine: Engine::new(config),
@@ -133,6 +137,7 @@ impl Runtime {
             store,
             tray,
             caps,
+            tr,
             warnings: BTreeMap::new(),
             label: "??".into(),
             last: None,
@@ -227,16 +232,14 @@ impl Runtime {
             PlatformEvent::PointerMoved { pos: _ } => {
                 // A queued sample can belong to the previous visible interval. Resolve
                 // the cursor again so it cannot move a newly shown badge backwards.
-                if self.overlay_visible {
-                    if let Some(pos) = self.ports.pointer.cursor_pos() {
-                        if self
-                            .last
-                            .as_ref()
-                            .is_some_and(|last| last.anchor != ResolvedAnchor::Cursor(pos))
-                        {
-                            self.event(Event::Pointer { pos }, now_ms);
-                        }
-                    }
+                if self.overlay_visible
+                    && let Some(pos) = self.ports.pointer.cursor_pos()
+                    && self
+                        .last
+                        .as_ref()
+                        .is_some_and(|last| last.anchor != ResolvedAnchor::Cursor(pos))
+                {
+                    self.event(Event::Pointer { pos }, now_ms);
                 }
             }
             PlatformEvent::OverlayScaleChanged { dpi: _ } => {
@@ -269,6 +272,7 @@ impl Runtime {
                 Event::SetLayoutFallbackEnabled(!config.layout.fallback_enabled)
             }
             MenuCommand::ToggleSound => Event::SetSoundEnabled(!config.sound.enabled),
+            MenuCommand::SetUiLanguage(tag) => Event::SetUiLanguage(tag),
             MenuCommand::ToggleAutostart => Event::SetAutostart(!config.autostart),
             MenuCommand::Quit => {
                 self.quitting = true;
@@ -388,6 +392,7 @@ impl Runtime {
                 Effect::SetLayoutFallbackEnabled(enabled) => {
                     self.apply_layout_fallback(enabled);
                 }
+                Effect::ApplyUiLanguage => self.apply_ui_language(),
                 Effect::ApplyAutostart(want) => {
                     let actual = match self.ports.autostart.set_enabled(want) {
                         Ok(()) => {
@@ -461,6 +466,37 @@ impl Runtime {
         }
     }
 
+    /// Rebuilds the translator from the current config and redraws every piece of
+    /// user-visible text. Called on startup and whenever the language changes; it plays no
+    /// sound and shows no badge, because picking a menu language is not an input event.
+    fn apply_ui_language(&mut self) {
+        let configured = self.engine.config().ui_language.clone();
+        // Reading the OS preference is only meaningful for "auto", and it is the one path
+        // that can fail. A failure is logged and treated as "no preference": the fallback
+        // catalog still gives the user a working menu.
+        let system = if configured == switcher_core::config::UI_LANGUAGE_AUTO {
+            match self.ports.ui_languages.preferred() {
+                Ok(languages) => languages,
+                Err(error) => {
+                    tracing::warn!(code = error.code, detail = %error.detail,
+                        "could not read the display language preference; using English");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        self.tr = Translator::for_config(&configured, &system);
+        tracing::info!(
+            configured = %configured,
+            active = self.tr.locale().tag,
+            "interface language applied"
+        );
+        self.tray
+            .send(TrayCommand::Localize(Box::new(TrayLabels::new(&self.tr))));
+        self.publish_status();
+    }
+
     fn apply_layout_fallback(&mut self, enabled: bool) {
         match self.ports.layout_monitor.set_fallback_enabled(enabled) {
             Ok(()) => self.clear_warning("layout_fallback_update_failed"),
@@ -481,14 +517,14 @@ impl Runtime {
         if self.caps.apply(report.clone()) {
             if report.capability == Capability::Overlay {
                 self.overlay_visible = report.state == CapabilityState::Ok && self.last.is_some();
-                if self.overlay_visible {
-                    if let Some(last) = self.last.clone() {
-                        // The native show can emit a DPI hint before its recovery Ok.
-                        // Re-check here because hints were ignored while unavailable.
-                        let dpi = self.ports.overlay.dpi_for(last.anchor);
-                        if dpi != last.dpi {
-                            self.show(last.content, last.anchor, dpi);
-                        }
+                if self.overlay_visible
+                    && let Some(last) = self.last.clone()
+                {
+                    // The native show can emit a DPI hint before its recovery Ok.
+                    // Re-check here because hints were ignored while unavailable.
+                    let dpi = self.ports.overlay.dpi_for(last.anchor);
+                    if dpi != last.dpi {
+                        self.show(last.content, last.anchor, dpi);
                     }
                 }
                 if report.state == CapabilityState::Off {
@@ -523,11 +559,12 @@ impl Runtime {
             layout_fallback: config.layout.fallback_enabled,
             sound: config.sound.enabled,
             autostart: config.autostart,
+            ui_language: config.ui_language.clone(),
         }));
     }
 
     fn publish_status(&self) {
-        let mut rows = compose_status(&self.caps);
+        let mut rows = compose_status(&self.caps, &self.tr);
         if !self.warnings.is_empty() && self.caps.degraded().next().is_none() {
             rows.clear();
         }
@@ -536,11 +573,14 @@ impl Runtime {
                 .iter()
                 .map(|(key, value)| format!("{key}: {}", value.replace(['\r', '\n', '\t'], " "))),
         );
-        let tooltip = compose_tooltip(&self.label, &self.caps);
+        let tooltip = compose_tooltip(&self.label, &self.caps, &self.tr);
         let tooltip = if self.warnings.is_empty() {
             tooltip
         } else {
-            format!("{tooltip}\n⚠ Подробности в «Состояние»")
+            format!(
+                "{tooltip}\n{}",
+                self.tr.text(crate::i18n::ids::TOOLTIP_DETAILS)
+            )
         };
         self.tray
             .send(TrayCommand::SetTooltip(crate::capability::truncate_utf16(

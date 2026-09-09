@@ -49,10 +49,10 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("cue did not complete: {:?}", device.stats());
             }
             for event in rx.try_iter() {
-                if let PlatformEvent::CapabilityChanged(report) = event {
-                    if report.state == CapabilityState::Off {
-                        anyhow::bail!("audio unavailable: {} {}", report.code, report.detail);
-                    }
+                if let PlatformEvent::CapabilityChanged(report) = event
+                    && report.state == CapabilityState::Off
+                {
+                    anyhow::bail!("audio unavailable: {} {}", report.code, report.detail);
                 }
             }
             std::thread::sleep(Duration::from_millis(5));

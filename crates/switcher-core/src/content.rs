@@ -41,6 +41,11 @@ const FALLBACK_BG: Rgb8 = Rgb8 {
     b: 0x66,
 };
 
+/// Longest badge label kept from a primary language subtag. BCP 47 allows 8 characters;
+/// anything longer is a malformed tag, not a language, and must not widen the badge
+/// without bound.
+pub const MAX_LABEL_CHARS: usize = 8;
+
 /// Parses "#RRGGBB" (case-insensitive). Anything else is `None`.
 pub fn parse_hex_rgb(s: &str) -> Option<Rgb8> {
     let hex = s.strip_prefix('#')?;
@@ -65,16 +70,19 @@ pub struct BadgeContent {
 }
 
 impl BadgeContent {
-    /// Config colors win over the built-in palette; unknown languages get
-    /// a two-letter uppercase label on a neutral background.
+    /// Config colors win over the built-in palette; unknown languages get an uppercase
+    /// label on a neutral background.
     pub fn for_lang(lang: &LangTag, style: BadgeStyle, colors: &BTreeMap<String, String>) -> Self {
         let primary = lang.primary();
+        // The whole primary subtag, not its first two characters: "fil" is Filipino, and
+        // "FI" would name Finnish. BCP 47 caps a primary subtag at 8 characters, but this
+        // tag comes from the OS rather than from a validator, so bound it here as well.
         let label = if primary.is_empty() {
             "??".to_owned()
         } else {
             primary
                 .chars()
-                .take(2)
+                .take(MAX_LABEL_CHARS)
                 .collect::<String>()
                 .to_ascii_uppercase()
         };
@@ -194,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_language_gets_uppercased_two_letter_label_and_fallback_bg() {
+    fn unknown_language_gets_an_uppercased_label_and_fallback_bg() {
         let de = BadgeContent::for_lang(&LangTag::new("de-DE"), BadgeStyle::Text, &BTreeMap::new());
         assert_eq!(de.label, "DE");
         assert_eq!(
@@ -208,6 +216,37 @@ mod tests {
 
         let empty = BadgeContent::for_lang(&LangTag::new(""), BadgeStyle::Text, &BTreeMap::new());
         assert_eq!(empty.label, "??");
+    }
+
+    /// Truncating to two characters turned Filipino ("fil") into "FI", which reads as
+    /// Finnish. The whole primary subtag is the label; the rasterizer sizes the badge from
+    /// the measured ink, so a three-letter code simply makes it wider.
+    #[test]
+    fn three_letter_primary_subtags_are_not_truncated() {
+        for (tag, expected) in [
+            ("fil-PH", "FIL"),
+            ("fil", "FIL"),
+            ("haw-US", "HAW"),
+            ("chr-Cher-US", "CHR"),
+            ("fi-FI", "FI"),
+        ] {
+            let content =
+                BadgeContent::for_lang(&LangTag::new(tag), BadgeStyle::Text, &BTreeMap::new());
+            assert_eq!(content.label, expected, "tag {tag}");
+        }
+    }
+
+    /// A primary subtag is at most 8 characters in BCP 47, but the tag reaching this
+    /// function comes from `LCIDToLocaleName`, not from a validator. A pathological value
+    /// must not become an unbounded badge label.
+    #[test]
+    fn absurdly_long_primary_subtags_are_bounded() {
+        let content = BadgeContent::for_lang(
+            &LangTag::new("x".repeat(200)),
+            BadgeStyle::Text,
+            &BTreeMap::new(),
+        );
+        assert_eq!(content.label.chars().count(), MAX_LABEL_CHARS);
     }
 
     /// `BadgeContent` is the cache key of the badge rasterizer (ADR-0006), so it has to

@@ -7,9 +7,9 @@ exclude = ["vendor/tray-icon"]
 tray-icon = { path = "vendor/tray-icon" }
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -26,6 +26,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 directories = "6.0"
+# UI localization (ADR-0021/ADR-0022). `unic-langid` also normalizes the `ui_language`
+# config value in switcher-core, which is why it is a workspace dependency rather than
+# a private one of the shell.
+fluent-bundle = "0.16"
+unic-langid = "0.9"
 # Every dependency below is trimmed per ADR-0008: default features pulled in decoders,
 # PNG and variable-font machinery that M1 never uses, against a 1-4 MB binary budget.
 # `muda` is reached through `tray_icon::menu`, so it is deliberately not a direct

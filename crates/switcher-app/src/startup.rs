@@ -3,12 +3,13 @@
 use crate::{
     capability::{CapabilityMap, compose_status},
     config_io::ConfigStore,
+    i18n::{Translator, ids},
     menu::MenuCommand,
     paths::{self, AppPaths},
     render::{BadgeCache, BadgeMetrics, FONT},
     runtime::{self, Ports, Runtime, TraySender},
     sound::{NullSoundPlayer, SoundDevice, WasapiSoundPlayer},
-    tray::{self, Checks, TrayCommand, TrayInit},
+    tray::{self, Checks, TrayCommand, TrayInit, TrayLabels},
 };
 use anyhow::{Context, bail};
 use crossbeam_channel::{Sender, bounded, unbounded};
@@ -23,7 +24,8 @@ use switcher_platform::{
 };
 use switcher_windows::{
     autostart::RegistryAutostart, dpi, layout_monitor::LayoutHooks, overlay::Overlay,
-    pointer::Pointer, tsf::TsfSource, win_util::current_thread_waker,
+    pointer::Pointer, single_instance, tsf::TsfSource, ui_languages::SystemUiLanguages,
+    win_util::current_thread_waker,
 };
 
 #[derive(Debug, Default)]
@@ -96,6 +98,36 @@ fn unavailable(caps: &mut CapabilityMap, capability: Capability, error: Platform
 }
 
 pub fn run(options: Options) -> anyhow::Result<()> {
+    // A second tray icon for the same layout is confusing, and the installer needs this
+    // name to detect a running copy (ADR-0024). Diagnostic launches are explicitly
+    // isolated by `--data-dir`, so they are allowed to run alongside a normal one.
+    //
+    // Logging is not up yet, so a failure here cannot be reported directly: the shipped
+    // binary is a GUI-subsystem process with no console, and stderr is discarded. The
+    // detail is carried to the warning list below instead, which reaches both the log file
+    // and the tray's Status submenu.
+    let mut single_instance_warning = None;
+    let _single_instance = if options.data_dir.is_none() {
+        match single_instance::acquire(single_instance::APP_MUTEX_NAME) {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => {
+                // Not an error: the user launched it twice, and one copy is already there.
+                // Exiting silently is the point — a second process must not adopt the
+                // first one's log file just to announce that it is redundant.
+                eprintln!("lang-switcher is already running");
+                return Ok(());
+            }
+            // Losing the guard must not stop the user from running the application, but it
+            // has to be visible: this is also the case where the installer stops being
+            // able to detect a running copy.
+            Err(error) => {
+                single_instance_warning = Some(error.detail);
+                None
+            }
+        }
+    } else {
+        None
+    };
     // Handler installation must precede the first event (OnceCell in both libraries).
     let (events_tx, events_rx) = unbounded::<PlatformEvent>();
     let (menu_tx, menu_rx) = unbounded::<MenuCommand>();
@@ -115,6 +147,9 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         .iter()
         .map(|w| ("config_load", w.clone()))
         .collect();
+    if let Some(detail) = single_instance_warning {
+        warnings.push(("single_instance_unavailable", detail));
+    }
     // Named guard remains alive until all service and thread owners have dropped.
     let _log_guard = match crate::logging::init(&paths.log_dir, &loaded.config.log_level) {
         Ok(guard) => Some(guard),
@@ -192,6 +227,24 @@ pub fn run(options: Options) -> anyhow::Result<()> {
             "Caret anchoring is planned for M2; using cursor or fixed position",
         ),
     );
+    // The interface language is resolved once here and handed to both the tray and the
+    // runtime, so the first menu the user sees is already in the right language and no
+    // redundant OS query happens during initialization (ADR-0022).
+    let ui_languages = SystemUiLanguages;
+    let system_languages = match ui_languages.preferred() {
+        Ok(languages) => languages,
+        Err(error) => {
+            tracing::warn!(code = error.code, detail = %error.detail,
+                "could not read the display language preference; using English");
+            Vec::new()
+        }
+    };
+    let translator = Translator::for_config(&loaded.config.ui_language, &system_languages);
+    tracing::info!(
+        configured = %loaded.config.ui_language,
+        active = translator.locale().tag,
+        "interface language selected"
+    );
     let cache = BadgeCache::new(FONT, BadgeMetrics::default())?;
     let unknown = BadgeContent::for_lang(
         &LangTag::new(""),
@@ -201,14 +254,16 @@ pub fn run(options: Options) -> anyhow::Result<()> {
     let init = TrayInit {
         rgba: cache.tray_rgba(&unknown, 16)?,
         size: 16,
-        tooltip: "lang-switcher · запуск".into(),
-        status: compose_status(&caps),
+        tooltip: translator.text(ids::TOOLTIP_STARTING),
+        status: compose_status(&caps, &translator),
         checks: Checks {
             follow: loaded.config.badge.mode == switcher_core::config::BadgeMode::Follow,
             layout_fallback: loaded.config.layout.fallback_enabled,
             sound: loaded.config.sound.enabled,
             autostart: loaded.config.autostart,
+            ui_language: loaded.config.ui_language.clone(),
         },
+        labels: TrayLabels::new(&translator),
         autostart_available: true,
     };
     let ports = Ports {
@@ -218,6 +273,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         caret: Box::new(NullCaretLocator),
         sound,
         autostart: Box::new(RegistryAutostart::new()),
+        ui_languages: Box::new(ui_languages),
     };
     let (tray_tx, tray_rx) = unbounded();
     let tray_sender = TraySender::new(tray_tx)
@@ -230,6 +286,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         loaded.store,
         tray_sender.clone(),
         caps,
+        translator,
     );
     for (key, detail) in warnings {
         runtime.add_warning(key, detail);

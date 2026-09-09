@@ -20,6 +20,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 directories = { workspace = true }
+fluent-bundle = { workspace = true }
+unic-langid = { workspace = true }
 tiny-skia = { workspace = true }
 ab_glyph = { workspace = true }
 
@@ -31,3 +33,8 @@ tray-icon = { workspace = true }
 
 [lints]
 workspace = true
+
+# Build-time only: compiles the VERSIONINFO and icon resource. It never becomes part of
+# the shipped binary's dependency tree, so ADR-0008's runtime trimming does not apply.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"

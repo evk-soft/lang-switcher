@@ -324,6 +324,25 @@ mod tests {
         &image.bgra_premul[offset..offset + 4]
     }
 
+    /// Badge labels are whole primary language subtags now, up to
+    /// `switcher_core::content::MAX_LABEL_CHARS`. The overlay badge may grow wider, but a
+    /// tray icon has a fixed edge: the shrink-to-fit loop must still land on exactly 16x16.
+    #[test]
+    fn long_labels_still_produce_a_square_tray_icon_and_a_wider_badge() {
+        let mut cache = cache();
+        let mut wide = content(BadgeStyle::Text);
+        wide.label = "W".repeat(switcher_core::content::MAX_LABEL_CHARS);
+        let rgba = cache.tray_rgba(&wide, 16).unwrap();
+        assert_eq!(rgba.len(), 16 * 16 * 4);
+
+        let narrow = cache.image(&content(BadgeStyle::Text), 96).unwrap().width;
+        let widest = cache.image(&wide, 96).unwrap().width;
+        assert!(
+            widest > narrow,
+            "an eight-character label must not be clipped into the two-character width"
+        );
+    }
+
     #[test]
     fn size_scales_with_dpi_and_buffer_matches_dimensions() {
         let mut cache = cache();
