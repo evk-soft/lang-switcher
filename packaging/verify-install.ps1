@@ -79,6 +79,7 @@ try {
     }
     Check 'a Start menu shortcut exists' { Test-Path $Shortcut }
     Check 'installing did not create an autostart entry' {
+        -not (Test-Path $RunKey) -or
         $null -eq (Get-ItemProperty $RunKey -Name $RunValue -ErrorAction SilentlyContinue)
     }
 
@@ -99,8 +100,16 @@ try {
     Write-Host "`n[uninstall]"
     # Autostart is a tray option, so a fresh install has no Run value. Write one by hand to
     # prove that uninstalling removes whatever the application may have left behind.
+    # The key itself may not exist at all on a fresh profile — a CI runner is exactly that
+    # — and the application would create it too, through RegCreateKeyExW.
+    if (-not (Test-Path $RunKey)) {
+        New-Item -Path $RunKey -Force | Out-Null
+    }
     New-ItemProperty -Path $RunKey -Name $RunValue -Value "`"$installed`"" `
         -PropertyType String -Force | Out-Null
+    Check 'the autostart value under test was written' {
+        $null -ne (Get-ItemProperty $RunKey -Name $RunValue -ErrorAction SilentlyContinue)
+    }
 
     $uninstaller = Get-ChildItem $InstallDir -Filter 'unins*.exe' -File | Select-Object -First 1
     Check 'an uninstaller was registered' { $null -ne $uninstaller }
@@ -116,6 +125,7 @@ try {
     Check 'the program directory is gone' { -not (Test-Path $InstallDir) }
     Check 'the Start menu shortcut is gone' { -not (Test-Path $Shortcut) }
     Check 'the autostart value is gone' {
+        -not (Test-Path $RunKey) -or
         $null -eq (Get-ItemProperty $RunKey -Name $RunValue -ErrorAction SilentlyContinue)
     }
     if ($hadSettings) {

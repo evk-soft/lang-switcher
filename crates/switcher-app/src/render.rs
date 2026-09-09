@@ -137,7 +137,7 @@ impl BadgeCache {
             return Err(RenderError::TooLarge);
         }
         let mut data = image.bgra_premul;
-        for p in data.chunks_exact_mut(4) {
+        for p in data.as_chunks_mut::<4>().0 {
             p.swap(0, 2);
             let alpha = u32::from(p[3]);
             for c in &mut p[..3] {
@@ -265,7 +265,7 @@ pub fn render_badge(
         );
     }
     let mut bgra_premul = pixmap.take();
-    for px in bgra_premul.chunks_exact_mut(4) {
+    for px in bgra_premul.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
     Ok(BadgeImage {
@@ -380,13 +380,17 @@ mod tests {
             assert!(
                 image
                     .bgra_premul
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3])
             );
             assert!(
                 image
                     .bgra_premul
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .filter(|p| p[0] >= 200 && p[1] >= 200 && p[2] >= 200 && p[3] == 255)
                     .count()
                     >= 8
@@ -463,7 +467,9 @@ mod tests {
         );
         assert_eq!(rgba[3], 0);
         assert!(
-            rgba.chunks_exact(4)
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
                 .any(|p| p[3] > 0 && p[3] < 255 && p[0] > p[3])
         );
         for label in ["RU", "EN", "WW"] {
@@ -472,7 +478,9 @@ mod tests {
             let rgba = cache.tray_rgba(&c, 16).unwrap();
             assert_eq!(rgba.len(), 16 * 16 * 4);
             assert!(
-                rgba.chunks_exact(4)
+                rgba.as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|p| p[0] > 230 && p[1] > 230 && p[2] > 230)
             );
         }
