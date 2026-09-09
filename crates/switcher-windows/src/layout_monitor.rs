@@ -105,11 +105,11 @@ fn notify(reason: u32) {
 fn notify_with(reason: u32, wake: impl FnOnce() -> Result<(), PlatformError>) {
     let before = PENDING.get();
     PENDING.set(before | reason);
-    if before == 0 {
-        if let Err(error) = wake() {
-            PENDING.set(0);
-            tracing::warn!(?error, "layout pump wake failed");
-        }
+    if before == 0
+        && let Err(error) = wake()
+    {
+        PENDING.set(0);
+        tracing::warn!(?error, "layout pump wake failed");
     }
 }
 
@@ -399,14 +399,14 @@ impl PumpHandler for LayoutThread<'_> {
             }
             self.publish(LayoutSource::ShellHook);
         }
-        if pending & TIMER != 0 || (!was_enabled && self.enabled) {
-            if let Some((hwnd, tid)) = target {
-                self.ticks += 1;
-                self.publish_read(
-                    LayoutSource::ForegroundPoll,
-                    snapshot::current_if_foreground(hwnd.0 as usize, tid),
-                );
-            }
+        if (pending & TIMER != 0 || (!was_enabled && self.enabled))
+            && let Some((hwnd, tid)) = target
+        {
+            self.ticks += 1;
+            self.publish_read(
+                LayoutSource::ForegroundPoll,
+                snapshot::current_if_foreground(hwnd.0 as usize, tid),
+            );
         }
         PumpVerdict::Continue
     }

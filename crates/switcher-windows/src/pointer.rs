@@ -242,11 +242,13 @@ unsafe extern "system" fn pointer_wndproc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         },
         || {
-            if msg == WM_INPUT && ACTIVE.get() && !PENDING.replace(true) {
-                if let Err(error) = PumpWaker::new(current_thread_id()).wake() {
-                    PENDING.set(false);
-                    tracing::warn!(code = error.code, "could not wake pointer pump");
-                }
+            if msg == WM_INPUT
+                && ACTIVE.get()
+                && !PENDING.replace(true)
+                && let Err(error) = PumpWaker::new(current_thread_id()).wake()
+            {
+                PENDING.set(false);
+                tracing::warn!(code = error.code, "could not wake pointer pump");
             }
             // SAFETY: WM_INPUT requires default cleanup for foreground raw input. Always
             // forwarding also covers messages ignored while disarmed; no RAWINPUT is read.

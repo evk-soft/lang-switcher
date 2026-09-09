@@ -156,12 +156,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sender.play(samples);
         while device.stats().completed == 0 {
             for event in rx.try_iter() {
-                if let PlatformEvent::CapabilityChanged(report) = event {
-                    if report.state == CapabilityState::Off {
-                        return Err(
-                            format!("audio failed: {} {}", report.code, report.detail).into()
-                        );
-                    }
+                if let PlatformEvent::CapabilityChanged(report) = event
+                    && report.state == CapabilityState::Off
+                {
+                    return Err(format!("audio failed: {} {}", report.code, report.detail).into());
                 }
             }
             if began.elapsed() > Duration::from_secs(5) {

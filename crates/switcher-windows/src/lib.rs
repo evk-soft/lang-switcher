@@ -10,6 +10,8 @@ pub mod layout_monitor;
 pub mod overlay;
 pub mod pointer;
 pub mod quit_signal;
+pub mod single_instance;
 pub mod supervise;
 pub mod tsf;
+pub mod ui_languages;
 pub mod win_util;

@@ -47,4 +47,85 @@ fn main() {
 
     println!("cargo::rustc-link-arg-bins=/MANIFEST:EMBED");
     println!("cargo::rustc-link-arg-bins=/MANIFESTINPUT:{path}");
+
+    embed_version_and_icon(&manifest_dir);
+}
+
+/// Compiles a generated `.rc` carrying the application icon and a VERSIONINFO block.
+///
+/// Without it Explorer shows a blank "Details" tab and a generic icon — for an unsigned
+/// alpha those are the only identity the binary has. The script is generated rather than
+/// checked in so the version can never drift from `Cargo.toml`.
+fn embed_version_and_icon(manifest_dir: &str) {
+    let dir = std::path::Path::new(manifest_dir);
+    let icon = dir.join("assets/icons/lang-switcher.ico");
+    println!("cargo::rerun-if-changed={}", icon.display());
+    if !icon.is_file() {
+        println!(
+            "cargo::warning=assets/icons/lang-switcher.ico not found; \
+             regenerate it with `cargo run -p switcher-app --example make_icon`"
+        );
+        return;
+    }
+
+    let version = env!("CARGO_PKG_VERSION");
+    // FILEVERSION takes four numbers, so the pre-release suffix ("0.1.0-alpha.1") cannot
+    // go there. The numeric field keeps major.minor.patch.0; the human-readable string
+    // below carries the full version, suffix included.
+    let numeric: Vec<&str> = version
+        .split('-')
+        .next()
+        .unwrap_or("0.0.0")
+        .split('.')
+        .collect();
+    let (major, minor, patch) = (
+        numeric.first().copied().unwrap_or("0"),
+        numeric.get(1).copied().unwrap_or("0"),
+        numeric.get(2).copied().unwrap_or("0"),
+    );
+
+    // No `#include <winresrc.h>`: FILEOS 0x4 is VOS__WINDOWS32 and FILETYPE 0x1 is
+    // VFT_APP, and spelling them numerically keeps this independent of SDK headers.
+    // 0x0409 is US English and 1200 is the Unicode codepage, the pair every localized
+    // Windows reads when it finds no block for its own language.
+    let rc = format!(
+        r#"1 ICON "{icon}"
+
+1 VERSIONINFO
+FILEVERSION {major},{minor},{patch},0
+PRODUCTVERSION {major},{minor},{patch},0
+FILEOS 0x4L
+FILETYPE 0x1L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "evk-soft"
+            VALUE "FileDescription", "lang-switcher - keyboard layout indicator"
+            VALUE "FileVersion", "{version}"
+            VALUE "InternalName", "lang-switcher"
+            VALUE "LegalCopyright", "MIT OR Apache-2.0"
+            VALUE "OriginalFilename", "lang-switcher.exe"
+            VALUE "ProductName", "lang-switcher"
+            VALUE "ProductVersion", "{version}"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+"#,
+        // RC accepts forward slashes in a path, and unlike the backslashes
+        // `Path::join` produces on Windows they need no escaping.
+        icon = icon.display().to_string().replace('\\', "/"),
+    );
+
+    let out_dir = std::env::var("OUT_DIR").expect("cargo always sets OUT_DIR");
+    let script = std::path::Path::new(&out_dir).join("lang-switcher.rc");
+    std::fs::write(&script, rc).expect("the build script can write into OUT_DIR");
+    embed_resource::compile(&script, embed_resource::NONE)
+        .manifest_required()
+        .expect("rc.exe ships with the MSVC toolchain this target already links with");
 }

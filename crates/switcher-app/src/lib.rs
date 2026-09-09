@@ -4,6 +4,7 @@
 
 pub mod capability;
 pub mod config_io;
+pub mod i18n;
 pub mod logging;
 pub mod menu;
 pub mod paths;

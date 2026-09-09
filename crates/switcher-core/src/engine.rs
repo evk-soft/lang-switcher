@@ -27,6 +27,8 @@ pub enum Event {
     HideTimerFired,
     SetMode(BadgeMode),
     SetSoundEnabled(bool),
+    /// `UI_LANGUAGE_AUTO` or a language tag; sanitized like any config value (ADR-0022).
+    SetUiLanguage(String),
     SetLayoutFallbackEnabled(bool),
     SetAutostart(bool),
     /// The runtime's answer to `Effect::ApplyAutostart`, and the same path startup
@@ -72,6 +74,10 @@ pub enum Effect {
         lang: LangTag,
     },
     SetLayoutFallbackEnabled(bool),
+    /// The interface language changed: the shell rebuilds its translator from
+    /// `Engine::config().ui_language` and redraws every piece of user-visible text. No
+    /// payload, because the config is already the single source of truth for it.
+    ApplyUiLanguage,
     ApplyAutostart(bool),
     /// Config changed: runtime saves it and re-syncs tray checkmarks.
     PersistConfig,
@@ -143,6 +149,27 @@ impl Engine {
                 }
                 self.cfg.sound.enabled = enabled;
                 vec![Effect::PersistConfig]
+            }
+            Event::SetUiLanguage(tag) => {
+                // Normalize through the same function the config file goes through, so a
+                // tray click and a hand-edited TOML cannot disagree about what a tag means.
+                let mut warnings = Vec::new();
+                let tag = crate::config::normalize_ui_language(&tag, &mut warnings);
+                // A malformed tag would have been normalized to "auto"; treat it as a
+                // rejected click rather than as a silent reset of the user's choice.
+                //
+                // Both refusals still re-sync the menu, and that is not cosmetic. Unlike
+                // the other tray entries, which always arrive as a negated value and so
+                // can never be a no-op, a language row can be clicked while it is already
+                // ticked. The menu library toggles a check item's native state itself
+                // before it delivers the event, so returning no effects at all would
+                // leave the submenu with nothing ticked while the config is unchanged.
+                // Same reasoning as the refused-autostart branch below.
+                if !warnings.is_empty() || self.cfg.ui_language == tag {
+                    return vec![Effect::SyncTrayMenu];
+                }
+                self.cfg.ui_language = tag;
+                vec![Effect::ApplyUiLanguage, Effect::PersistConfig]
             }
             Event::SetLayoutFallbackEnabled(enabled) => {
                 if self.cfg.layout.fallback_enabled == enabled {
@@ -684,6 +711,61 @@ mod tests {
         let mut e = engine_after_initial(); // sound.enabled == true by default
         assert_eq!(e.handle(Event::SetSoundEnabled(true), 1200), vec![]);
         assert!(e.config().sound.enabled);
+    }
+
+    #[test]
+    fn set_ui_language_normalizes_stores_and_persists() {
+        let mut e = engine_after_initial(); // ui_language == "auto" by default
+        let fx = e.handle(Event::SetUiLanguage("ru".into()), 1200);
+        assert_eq!(fx, vec![Effect::ApplyUiLanguage, Effect::PersistConfig]);
+        assert_eq!(e.config().ui_language, "ru");
+
+        // Canonicalization happens before the comparison, so this is the same language:
+        // no write, only the menu re-sync.
+        assert_eq!(
+            e.handle(Event::SetUiLanguage("RU".into()), 1300),
+            vec![Effect::SyncTrayMenu]
+        );
+        assert_eq!(e.config().ui_language, "ru");
+
+        let fx = e.handle(Event::SetUiLanguage("zh-hans".into()), 1400);
+        assert_eq!(fx, vec![Effect::ApplyUiLanguage, Effect::PersistConfig]);
+        assert_eq!(e.config().ui_language, "zh-Hans");
+    }
+
+    /// Re-selecting the ticked language changes nothing, but must still re-assert the
+    /// menu: the library already unticked the row before we saw the click, and no other
+    /// code path re-sends the check state.
+    #[test]
+    fn re_selecting_the_current_ui_language_only_resyncs_the_menu() {
+        let mut e = engine_after_initial();
+        assert_eq!(
+            e.handle(Event::SetUiLanguage("auto".into()), 1200),
+            vec![Effect::SyncTrayMenu]
+        );
+        assert_eq!(e.config().ui_language, "auto");
+
+        e.handle(Event::SetUiLanguage("de".into()), 1300);
+        assert_eq!(
+            e.handle(Event::SetUiLanguage("DE".into()), 1400),
+            vec![Effect::SyncTrayMenu],
+            "a differently spelled but equal tag is also a re-selection"
+        );
+        assert_eq!(e.config().ui_language, "de");
+    }
+
+    /// A malformed tag must leave the choice alone. Falling through to the sanitizer would
+    /// turn one bad menu id into a silent reset to "same as the system".
+    #[test]
+    fn a_malformed_ui_language_is_rejected_rather_than_reset() {
+        let mut e = engine_after_initial();
+        e.handle(Event::SetUiLanguage("de".into()), 1200);
+        assert_eq!(e.config().ui_language, "de");
+        assert_eq!(
+            e.handle(Event::SetUiLanguage("not a tag!".into()), 1300),
+            vec![Effect::SyncTrayMenu]
+        );
+        assert_eq!(e.config().ui_language, "de");
     }
 
     #[test]

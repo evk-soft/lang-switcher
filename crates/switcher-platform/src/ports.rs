@@ -78,6 +78,34 @@ pub trait Autostart: Send {
     fn set_enabled(&self, enabled: bool) -> Result<(), PlatformError>;
 }
 
+/// The user's OS **display language** preference, most preferred first (ADR-0022).
+///
+/// This is not the input language: what the user types is read from the keyboard layout
+/// and travels as `LangTag` in `PlatformEvent::LayoutChanged`. It is not the regional
+/// format setting either — a Russian Windows with US date formats must still show a
+/// Russian interface.
+///
+/// Entries are plain Unicode language identifier strings ("en-US", "zh-Hans-CN"). The
+/// adapter does not filter them against the shipped catalogs: choosing among them is the
+/// shell's job, so a new translation needs no adapter change. An empty list is a valid
+/// answer and means "no preference expressed"; the shell then uses English.
+///
+/// Called on the shell's thread at startup and whenever the user picks "same as the
+/// system", so it must not block on a message pump.
+pub trait UiLanguages: Send {
+    fn preferred(&self) -> Result<Vec<String>, PlatformError>;
+}
+
+/// Used where no OS answer is available (non-Windows builds, tests): no preference.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoUiLanguages;
+
+impl UiLanguages for NoUiLanguages {
+    fn preferred(&self) -> Result<Vec<String>, PlatformError> {
+        Ok(Vec::new())
+    }
+}
+
 /// Which cue to play on a layout switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoundCue {

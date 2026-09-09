@@ -16,11 +16,34 @@ pub const MAX_SHOW_MS: u64 = 10_000;
 pub const DEFAULT_SHOW_MS: u64 = 1_500;
 const DEFAULT_VOLUME: f32 = 0.4;
 const DEFAULT_LOG_LEVEL: &str = "info";
-const DEFAULT_UI_LANGUAGE: &str = "ru";
+/// `ui_language` value meaning "follow the Windows display language" (ADR-0022).
+pub const UI_LANGUAGE_AUTO: &str = "auto";
 /// The levels `tracing`'s `LevelFilter` parses, case-insensitively. Hardcoded on purpose:
 /// `switcher-core` must not take a dependency on `tracing` just to validate a string.
 const LOG_LEVELS: [&str; 6] = ["error", "warn", "info", "debug", "trace", "off"];
-const UI_LANGUAGES: [&str; 2] = ["ru", "en"];
+
+/// Canonicalizes a `ui_language` value: `UI_LANGUAGE_AUTO`, or a Unicode language
+/// identifier in canonical case (`EN` -> `en`, `zh-hans` -> `zh-Hans`, `ru_RU` -> `ru-RU`).
+///
+/// Deliberately does NOT check that a catalog exists for the tag (ADR-0022): the set of
+/// shipped translations lives in the shell, and a valid tag must survive a downgrade to a
+/// build that carries fewer of them.
+pub(crate) fn normalize_ui_language(value: &str, warnings: &mut Vec<String>) -> String {
+    // `auto` is four ASCII letters, which BCP 47 accepts as a (reserved) language subtag,
+    // so it has to be recognized before parsing rather than after.
+    if value.eq_ignore_ascii_case(UI_LANGUAGE_AUTO) {
+        return UI_LANGUAGE_AUTO.to_owned();
+    }
+    match value.parse::<unic_langid::LanguageIdentifier>() {
+        Ok(langid) => langid.to_string(),
+        Err(error) => {
+            warnings.push(format!(
+                "ui_language {value:?} is not a language tag ({error}), reset to {UI_LANGUAGE_AUTO:?}"
+            ));
+            UI_LANGUAGE_AUTO.to_owned()
+        }
+    }
+}
 
 /// Lower-cases `value` and accepts it only if it is in `allowed`; otherwise falls back to
 /// `default` and says so. Without this, a typo in the config file travels all the way into
@@ -131,7 +154,7 @@ impl Default for Config {
             layout: LayoutConfig::default(),
             autostart: false,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
-            ui_language: DEFAULT_UI_LANGUAGE.to_owned(),
+            ui_language: UI_LANGUAGE_AUTO.to_owned(),
         }
     }
 }
@@ -235,14 +258,7 @@ impl Config {
             &mut warnings,
         );
         self.log_level = log_level;
-        let ui_language = normalize_enum(
-            &self.ui_language,
-            &UI_LANGUAGES,
-            DEFAULT_UI_LANGUAGE,
-            "ui_language",
-            &mut warnings,
-        );
-        self.ui_language = ui_language;
+        self.ui_language = normalize_ui_language(&self.ui_language, &mut warnings);
         warnings
     }
 }
@@ -265,7 +281,7 @@ mod tests {
         assert!(cfg.layout.fallback_enabled);
         assert!(!cfg.autostart);
         assert_eq!(cfg.log_level, "info");
-        assert_eq!(cfg.ui_language, "ru");
+        assert_eq!(cfg.ui_language, "auto");
     }
 
     #[test]
@@ -401,15 +417,53 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
+    /// ADR-0022: the core stores and canonicalizes the tag, it does not decide which
+    /// catalogs exist. A valid tag with no catalog must survive so that downgrading to a
+    /// build with fewer translations cannot silently rewrite the user's choice.
     #[test]
-    fn unknown_ui_language_resets_to_default_with_warning() {
-        let (cfg, warnings) = Config::from_toml_str("ui_language = \"fr\"\n").unwrap();
-        assert_eq!(cfg.ui_language, "ru");
-        assert_eq!(warnings.len(), 1);
+    fn valid_ui_language_tags_are_canonicalized_and_kept() {
+        for (written, expected) in [
+            ("auto", "auto"),
+            ("AUTO", "auto"),
+            ("ru", "ru"),
+            ("EN", "en"),
+            ("fr", "fr"),
+            ("zh-hans", "zh-Hans"),
+            ("ru_RU", "ru-RU"),
+            ("pt-br", "pt-BR"),
+            // No catalog ships for this one; the shell falls back to English at runtime.
+            ("ja", "ja"),
+        ] {
+            let (cfg, warnings) =
+                Config::from_toml_str(&format!("ui_language = {written:?}\n")).unwrap();
+            assert_eq!(cfg.ui_language, expected, "input {written:?}");
+            assert!(
+                warnings.is_empty(),
+                "input {written:?} warned: {warnings:?}"
+            );
+        }
+    }
 
-        let (cfg, warnings) = Config::from_toml_str("ui_language = \"EN\"\n").unwrap();
-        assert_eq!(cfg.ui_language, "en");
-        assert!(warnings.is_empty());
+    #[test]
+    fn malformed_ui_language_resets_to_auto_with_warning() {
+        for written in ["", "not a language!", "toolongsubtag", "-", "en-"] {
+            let (cfg, warnings) =
+                Config::from_toml_str(&format!("ui_language = {written:?}\n")).unwrap();
+            assert_eq!(cfg.ui_language, "auto", "input {written:?}");
+            assert_eq!(warnings.len(), 1, "input {written:?}");
+        }
+    }
+
+    /// Configs written by 0.1.0-alpha and earlier carry an explicit "ru" or "en"; both are
+    /// already canonical, so an upgrade must not warn or change them.
+    #[test]
+    fn previously_saved_explicit_languages_survive_untouched() {
+        for saved in ["ru", "en"] {
+            let (cfg, warnings) =
+                Config::from_toml_str(&format!("version = 1\nui_language = {saved:?}\n")).unwrap();
+            assert_eq!(cfg.ui_language, saved);
+            assert!(warnings.is_empty());
+        }
     }
 
     #[test]
